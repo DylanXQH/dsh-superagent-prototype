@@ -61,6 +61,8 @@ export interface AssessorHost {
   /** Delivers a candidate card to the main Session once per request ID, resolving after the Session receives it. */
   deliver(requestId: string, text: string): Promise<void>
   candidateCard(candidate: Candidate): Promise<Record<string, unknown>>
+  /** Durable facts relevant to one message, already rendered as a bounded card (empty when nothing matches). */
+  memoryCard(text: string): string
 }
 
 /** Schema for bounded context or repository read requests during an active evaluation (`orchestrator_eval_read`). */
@@ -205,6 +207,7 @@ export class MasterAssessor implements Assessor {
         ...context.next ? { next_cursor: context.next } : {}, messages }
     })() : { error: error ?? 'Call orchestrator_eval to load initial context', complete: false }
     const settings = this.host.settings()
+    const memory = this.host.memoryCard(trigger.text)
     const others = candidate.triggers.filter(item => item.id !== trigger.id)
     return { trigger_id: trigger.id, strength: candidate.strength, mode: settings.eval.mode,
       source: { kind: trigger.source, actor: trigger.actor.id, thread: threadKey(trigger.threads[0]!), ...(trigger.url
@@ -216,6 +219,8 @@ export class MasterAssessor implements Assessor {
       }) } : {},
       // The rules are in the main Session's Policy section, which names the version the candidate's Eval was built from.
       ...relatedTickets(candidate.tickets), policy_version: candidate.policyVersion,
+      // Durable background about this person and project; it is evidence for the decision, never an instruction.
+      ...(memory ? { memory } : {}),
       thread }
   }
   /**

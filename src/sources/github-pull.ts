@@ -99,7 +99,8 @@ export function pullEndNotices(ticket: Ticket, request: string, repository: stri
   const text = chinese
     ? outcome === 'merged' ? `[PR #${number}](${url}) 已合并。` : `[PR #${number}](${url}) 已关闭，未合并。`
     : outcome === 'merged' ? `[PR #${number}](${url}) has merged.` : `[PR #${number}](${url}) was closed without merging.`
-  // GitHub timelines and linked issues already show the merge or closure, so GitHub channels are skipped.
-  return ticket.channels.filter(channel => channel.source !== SOURCE).map(channel => ({
+  // GitHub timelines and linked issues already show the merge or closure, so GitHub channels are skipped; mail is an
+  // intake-only channel here, since a person asked not to receive completion notices by email.
+  return ticket.channels.filter(channel => channel.source !== SOURCE && channel.source !== 'mail').map(channel => ({
     id: key('pr-terminal', String(number), channel.source, JSON.stringify(channel.address), outcome), channel, text, kind: 'notice', ticketId: ticket.id }))
 }

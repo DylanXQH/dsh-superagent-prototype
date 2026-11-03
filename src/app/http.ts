@@ -1,14 +1,23 @@
 /** Loopback-only management HTTP routes with same-origin enforcement for the web panel. */
+import { recall, remember, retract } from './memory-store.ts'
+import { episodeStats, listEpisodes, readEpisode } from './episodes.ts'
+import { renderMemoryPage } from './memory-page.ts'
+import { baselineFindings, canaryFindings } from './baseline.ts'
+import { appendAudit } from './audit.ts'
+import { KV } from '../kv.ts'
 import type { Context } from '@deepseek-ai/cordis'
 import type {} from '@deepseek-ai/dsh-host-webserver'
 import type { IncomingMessage, ServerResponse } from 'node:http'
 import { z } from 'zod'
+import { key } from '../core/ids.ts'
 import { THREAD_FILTERS, TICKET_FILTERS, type Api, type ApiResponse, type RouteParams } from './api.ts'
 import { sourceSkills } from './context.ts'
 import type { ModelCatalog } from '@deepseek-ai/dsh-api-session-controller/types'
 import { PromptConflict, SKILL_NAME, SKILL_PREFIX, TEAM_SECTIONS, builtInBase, builtInParts, defaultPrompts, savePrompts, type Prompts }
   from './prompts.ts'
 import { policyVersion } from '../policy.ts'
+import { PromptConfigSchema } from './prompts.ts'
+import { describeBlocking, scanPromptChange, scanText } from './scan.ts'
 import { SettingsConflict, type Settings } from './settings.ts'
 import { SetupError, type SetupProblem } from '../setup.ts'
 import { UserError, type EngineForPeople, type Ticket } from '../core/index.ts'
@@ -17,6 +26,8 @@ import type { DshExecutor } from '../executor/dsh.ts'
 import type { Health } from '../sources/host.ts'
 import type { SourceRegistry } from '../sources/registry.ts'
 import type { Sessions } from './sessions.ts'
+import { activeWorkerRpcHub } from './worker-rpc.ts'
+import { eventLevel } from '@dsh-superagent/rpc'
 import type { Store } from './store.ts'
 import type { TextCache } from './cache.ts'
 import type { LinkTarget, ViewHost } from './views/records.ts'
@@ -34,7 +45,7 @@ export interface HttpHost {
   readonly sourceLinks: Pick<TextCache, 'entries'>
   readonly sources: SourceRegistry
   readonly prompts: Pick<Prompts, 'current' | 'version' | 'history' | 'preview' | 'save' | 'defaultChanged'>
-  readonly sessions: Pick<Sessions, 'status' | 'notify' | 'delivery'>
+  readonly sessions: Pick<Sessions, 'status' | 'notify' | 'delivery' | 'ensure' | 'prompt'>
   readonly settings: Pick<Settings, 'view' | 'save' | 'pause' | 'sync' | 'refreshLabels'>
   readonly engine: EngineForPeople
   readonly executor: Pick<DshExecutor, 'activeCount'>
@@ -145,15 +156,89 @@ const DecisionsQuery = z.object({ kind: z.string().default(''), window: z.litera
 const count = z.coerce.number().int().nonnegative()
 const PromptsQuery = z.object({ revision: count.optional(), offset: count.default(0) })
 const SourceBlock = z.templateLiteral(['source:', z.string().regex(/^[a-z][a-z0-9-]*$/)])
-const SettingsBlockSchema = z.union([z.enum(['policy', 'eval', 'executor']), SourceBlock])
+const SettingsBlockSchema = z.union([z.enum(['policy', 'eval', 'executor', 'notify']), SourceBlock])
 const SaveRequest = z.object({ value: z.unknown(), revision: z.number().int().nonnegative() })
 
 function routes(runtime: HttpHost): Routes {
   const { store } = runtime
-  const ticket = (id: string) => { if (!store.tickets.get(id)) throw new RouteError(404, 'Ticket not found'); return id }
+  const RememberRequest = z.object({ scope: z.enum(['user', 'project', 'env']), kind: z.enum(['preference', 'convention', 'fact', 'procedure']),
+  key: z.string().min(1).max(120), value: z.string().min(1).max(2000), confidence: z.number().min(0).max(1).optional(),
+  source: z.enum(['user-said', 'observed-trusted', 'observed-untrusted', 'inferred']).optional(), evidence: z.array(z.string().max(200)).max(20).optional(),
+  ttlDays: z.number().int().min(1).max(3650).optional() }).strict()
+const ticket = (id: string) => { if (!store.tickets.get(id)) throw new RouteError(404, 'Ticket not found'); return id }
   const promptBody = (input: { body: (maxBytes?: number) => Promise<unknown> }) => input.body(4 * runtime.machine.promptMaxChars.get() + 4096)
   return {
     'GET state': () => stateView(runtime),
+    'GET rpc/workers': () => {
+      const hub = activeWorkerRpcHub()
+      if (!hub) throw new RouteError(503, 'The worker RPC hub is not running')
+      return { workers: hub.workers, listeningPort: hub.listeningPort }
+    },
+    // 按需回拉：router 只落盘 L1，L2 只在内存，L3 从不外发；需要还原「当时到底
+    // 发生了什么」时才向会话所在 worker 拉取（公理 3 的补偿通道，不做周期拉取）。
+    'GET rpc/sessions/:id/events': async input => {
+      const hub = activeWorkerRpcHub()
+      if (!hub) throw new RouteError(503, 'The worker RPC hub is not running')
+      const query = z.object({
+        fromSeq: count.optional(),
+        toSeq: count.optional(),
+        limit: count.optional(),
+        types: z.string().optional(),
+      }).parse(input.query)
+      const result = await hub.pullEvents(input.params.id, {
+        ...(query.fromSeq === undefined ? {} : { fromSeq: query.fromSeq }),
+        ...(query.toSeq === undefined ? {} : { toSeq: query.toSeq }),
+        ...(query.limit === undefined ? {} : { limit: query.limit }),
+        ...(query.types === undefined || query.types.length === 0
+          ? {}
+          : { types: query.types.split(',').map(part => part.trim()).filter(Boolean) }),
+      })
+      return {
+        sessionId: result.sessionId,
+        hasMore: result.hasMore,
+        lastSeq: result.lastSeq,
+        events: result.events.map(event => ({
+          seq: event.seq,
+          ts: event.ts,
+          type: event.type,
+          level: eventLevel(event),
+          event: event.data,
+        })),
+      }
+    },
+    'POST rpc/call': async input => {
+      const hub = activeWorkerRpcHub()
+      if (!hub) throw new RouteError(503, 'The worker RPC hub is not running')
+      const request = z.object({ workerId: z.string(), method: z.string(), params: z.unknown().default({}) }).parse(await input.body())
+      return { ok: true, result: await hub.callWorker(request.workerId, request.method, request.params) }
+    },
+    // Temporary probe (removed once the executor drives remote Sessions end to end).
+    'POST rpc/session': async input => {
+      const request = z.object({ sessionId: z.string(), cwd: z.string(), title: z.string(), text: z.string(),
+        env: z.record(z.string(), z.string()).optional() }).parse(await input.body())
+      const agent = await runtime.sessions.ensure(request.sessionId, request.cwd, request.title, 'worker', request.env)
+      await runtime.sessions.prompt(request.sessionId, `probe-${Date.now()}`, request.text, 'queue')
+      return { ok: true, id: agent.id, status: agent.status }
+    },
+    // Temporary probe: 注入一条真实 Trigger，验证 Source→Eval→Ticket→Executor→远端 worker 的完整链路。
+    // 验完即删（真实票据只能由 Source 产生）。
+    'POST rpc/trigger': async input => {
+      const request = z.object({ text: z.string(), threadId: z.string().default('999'), actor: z.string().default('DylanXQH'),
+        addressed: z.enum(['mention', 'direct']).optional() }).parse(await input.body())
+      const result = runtime.engine.receive({
+        id: key('probe-trigger', String(Date.now())),
+        source: 'github',
+        threads: [{ source: 'github', id: request.threadId }],
+        actor: { source: 'github', id: request.actor },
+        human: true,
+        ...(request.addressed ? { addressed: request.addressed } : {}),
+        at: new Date().toISOString(),
+        text: request.text,
+        meta: { number: Number(request.threadId), isPr: false, kind: 'issue' },
+      })
+      runtime.requestPass()
+      return { ok: true, result }
+    },
     'GET overview': () => overview(views(runtime), runtime.health, policyVersion(store.settings()),
       executorLoad(store, runtime.executor.activeCount()), runtime.setupProblem ?? runtime.feishuProblem),
     'GET search': ({ query }) => search(views(runtime), query.q ?? '', runtime.sourceLinks),
@@ -190,6 +275,34 @@ function routes(runtime: HttpHost): Routes {
       return ticketList(views(runtime), state, offset, limit)
     },
     'GET tickets/:id': ({ params }) => ticketPage(runtime, params.id),
+    'POST memory/scan': async input => {
+      const request = z.object({ text: z.string(), where: z.string().optional() }).parse(await input.body())
+      return { findings: scanText(request.text, request.where ?? 'text') }
+    },
+    'GET memory': ({ query }) => {
+      const limit = Math.min(Math.max(Number(query.limit ?? 100) || 100, 1), 500)
+      const q = String(query.q ?? '')
+      const scope = query.scope === 'user' || query.scope === 'project' || query.scope === 'env' ? query.scope as 'user' | 'project' | 'env' : undefined
+      const items = q ? recall(store, q, { ...(scope ? { scope } : {}), limit }) : store.memories.list({ ...(scope ? { scope } : {}), limit })
+      return { items, total: store.memories.history(1000).length }
+    },
+    'GET memory/history': ({ query }) => ({ items: store.memories.history(Math.min(Number(query.limit ?? 200) || 200, 1000)) }),
+    'POST memory': async ({ body }) => {
+      const input = RememberRequest.parse(await body())
+      const { memory, superseded } = remember(store, input)
+      return { saved: true, memory, ...(superseded ? { superseded: superseded.id } : {}) }
+    },
+    'POST memory/:id/retract': ({ params }) => ({ retracted: true, memory: retract(store, params.id) }),
+    'GET episodes': ({ query }) => {
+      const limit = Math.min(Math.max(Number(query.limit ?? 50) || 50, 1), 200)
+      return { items: listEpisodes(store, limit), total: (store.get(KV.episodes.index) ?? []).length }
+    },
+    'GET episodes/stats': () => episodeStats(store),
+    'GET episodes/:id': ({ params }) => {
+      const episode = readEpisode(store, params.id)
+      if (!episode) throw new RouteError(404, 'Episode not found')
+      return episode
+    },
     'POST tickets/:id/retry': ({ params }) => { const id = ticket(params.id); runtime.engine.retryTicket(id); return { retried: true } },
     'POST tickets/:id/stop': ({ params }) => { const id = ticket(params.id); runtime.engine.stopTicket(id); return { stopped: true } },
     'POST executor/pause': async ({ body }) => runtime.settings.pause(z.object({ paused: z.boolean() }).parse(await body()).paused, 'panel'),
@@ -207,7 +320,38 @@ function routes(runtime: HttpHost): Routes {
     'GET prompts': ({ query }) => { const { revision, offset } = PromptsQuery.parse(query); return promptsView(runtime, revision, offset) },
     'PUT prompts': async input => {
       const request = z.object({ config: z.unknown(), baseRevision: z.number().int().nonnegative() }).parse(await promptBody(input))
-      return savePrompts(runtime, request.config, request.baseRevision, 'panel')
+      const next = PromptConfigSchema.parse(request.config)
+      // Program memory is the one artefact a model can rewrite about its own behaviour. The A/B gate scores success and
+      // is blind to a change that keeps success flat while opening a side channel, so text-level findings that a person
+      // must sign off on are refused here — before they ever reach a worker prompt.
+      const findings = scanPromptChange(runtime.prompts.current().config, next)
+      if (findings.some(finding => finding.severity === 'block')) throw new RouteError(422, describeBlocking(findings))
+      const baseline = baselineFindings(next)
+      if (baseline.length > 0) throw new RouteError(422, `基线检查未通过：${baseline.map(finding => finding.reason).join('；')}`)
+      const saved = await savePrompts(runtime, request.config, request.baseRevision, 'panel', version => {
+        // The audit write must never fail a change a person already approved; the store still holds the revision.
+        void appendAudit(runtime.machine.stateDir, {
+          kind: 'prompts', revision: version.revision, previousRevision: version.previousRevision, source: 'panel',
+          summary: `保存提示词版本 r${version.revision}`, findings: { block: 0, warn: findings.filter(item => item.severity === 'warn').length },
+        }).catch(() => undefined)
+      })
+      return saved
+    },
+    'GET prompts/baseline': () => { const findings = baselineFindings(runtime.prompts.current().config); return { ok: findings.length === 0, findings } },
+    'POST prompts/canary': () => canaryFindings(runtime.prompts.current().config),
+    'POST prompts/rollback': async input => {
+      const request = z.object({ revision: z.number().int().positive() }).parse(await input.body(64 * 1024))
+      const target = runtime.prompts.version(request.revision)
+      const current = runtime.prompts.current()
+      const baseline = baselineFindings(target.config)
+      if (baseline.length > 0) throw new RouteError(422, `该版本未通过基线检查：${baseline.map(finding => finding.reason).join('；')}`)
+      const saved = await savePrompts(runtime, target.config, current.revision, 'rollback', version => {
+        void appendAudit(runtime.machine.stateDir, {
+          kind: 'rollback', revision: version.revision, previousRevision: version.previousRevision, source: 'rollback',
+          summary: `回滚到 r${request.revision}（保存为 r${version.revision}）`, detail: { from: request.revision, base: current.revision },
+        }).catch(() => undefined)
+      })
+      return saved
     },
     'POST prompts/preview': async input => runtime.prompts.preview(await promptBody(input)),
   }
@@ -237,6 +381,12 @@ export function registerHttp(ctx: Context, runtime: HttpHost): () => void {
       if (!sameOrigin(req, ctx.webServer.port)) { json(res, 403, { error: 'Same-origin management request required' }); return }
       try {
         await runtime.ready
+        // HTML pages live under the API prefix so they share the token check, the same-origin guard, and the error path.
+        if (url.pathname === '/orchestrator/api/memory-page' && (req.method ?? 'GET') === 'GET') {
+          res.writeHead(200, { 'content-type': 'text/html; charset=utf-8', 'cache-control': 'no-store' })
+          res.end(renderMemoryPage(runtime.store))
+          return
+        }
         const route = match(table, req.method ?? 'GET', url.pathname.slice('/orchestrator/api/'.length).split('/'))
         if (!route) throw new RouteError(404, 'Unknown operation')
         const query = Object.fromEntries(url.searchParams)

@@ -1,3 +1,4 @@
+Every report is an `orchestrator_report` tool call: the ticket only advances from that call, so a conclusion written in your final answer alone reaches nobody and the person waiting for the result sees nothing.
 Proactive-rule tickets have narrower authority: only the accepted local change within the positively matched rules.
 Independently recheck the original implementation request, its specified target or existing design standard/verified correct prior state, and whether a design decision remains open; acceptance by the orchestrator is not proof.
 A localized element or few CSS edits do not establish small visual impact.

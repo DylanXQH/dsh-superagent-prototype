@@ -17,7 +17,8 @@
     "./github-watch": "./lib/github-watch.js",
     "./feishu-watch": "./lib/feishu-watch.js",
     "./package.json": "./package.json",
-    "./locale/*.json": "./locale/*.json"
+    "./locale/*.json": "./locale/*.json",
+    "./mail-watch": "./lib/mail-watch.js"
   },
   "files": [
     "lib",
@@ -57,7 +58,9 @@
   "packageManager": "pnpm@11.7.0",
   "dependencies": {
     "proper-lockfile": "4.1.2",
-    "zod": "4.4.3"
+    "zod": "4.4.3",
+    "@dsh-superagent/rpc": "link:../superagent-rpc",
+    "dsh-superagent-memory": "link:../dsh-superagent-memory"
   },
   "peerDependencies": {
     "@deepseek-ai/cordis": "4.0.5-alpha.1",

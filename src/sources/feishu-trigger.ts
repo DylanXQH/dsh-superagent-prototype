@@ -16,6 +16,18 @@ export type FeishuEvent = z.infer<typeof EventSchema>
 export const feishuThreadId = (chatId: string, rootId: string | undefined, messageId: string): string => `${chatId}:${rootId ?? messageId}`
 /** Deterministic trigger ID for a Feishu message; every read path for this message produces the same ID. */
 export const feishuTriggerId = (messageId: string): string => key('feishu', messageId)
+/**
+ * Feishu voice notes carry no text of their own: live events describe them as `<audio key="…" duration="3s"/>` while the
+ * history API hands over `{"file_key":"file_v3_…","duration":9000}`, so both shapes count as a voice note.
+ */
+export const isVoiceNote = (content: string): boolean => {
+  if (content.startsWith('<audio')) return true
+  if (!content.startsWith('{')) return false
+  try {
+    const parsed: unknown = JSON.parse(content)
+    return parsed !== null && typeof parsed === 'object' && 'file_key' in parsed && 'duration' in parsed
+  } catch { return false }
+}
 export const withMentionNames = (text: string, mentions: { key?: string | undefined; name?: string | undefined }[]): string =>
   mentions.reduce((result, mention) => mention.key && mention.name ? result.replaceAll(mention.key, `@${mention.name}`) : result, text)
 /**

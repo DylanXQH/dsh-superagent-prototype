@@ -24,13 +24,15 @@ export function declaredVariables(sources: SourceRegistry, settings?: Settings):
     ...sources.declarations().map(({ kind, variables }) => ({ owner: kind, enabled: on.has(kind), variables }))]
 }
 
-export function environmentOf(input: { deployment: Deployment; sources: SourceRegistry; settings: Settings; ticket?: { id: string; name: string; directory: string }; trigger?: Trigger }): Variable[] {
+export function environmentOf(input: { deployment: Deployment; sources: SourceRegistry; settings: Settings; ticket?: { id: string; name: string; directory: string; repository?: string }; trigger?: Trigger }): Variable[] {
   const { deployment, sources, settings, ticket, trigger } = input
+  // A ticket that named another repository overrides the deployment's primary one, so prepare and the worker both target it.
+  const override = ticket?.repository ? { DSH_SUPERAGENT_GITHUB_REPOSITORY: ticket.repository } : {}
   const executor: Record<string, string> = { DSH_SUPERAGENT_BLOCKED_COMMANDS: settings.executor.blockedCommands.join(' '), ...ticket ? { DSH_SUPERAGENT_DIR: ticket.directory, DSH_SUPERAGENT_NAME: ticket.name, DSH_SUPERAGENT_TICKET: ticket.id } : {} }
   const result: Variable[] = EXECUTOR_VARIABLES.filter(spec => !spec.ticket || ticket).map(spec => ({ key: spec.key, value: executor[spec.key] ?? '', description: spec.description, owner: 'executor' }))
   for (const { kind, environment, config } of sources.environments(settings)) {
     const values = environment.values({ deployment, config, ...trigger ? { trigger } : {} })
-    for (const spec of environment.variables) result.push({ key: spec.key, value: values[spec.key] ?? '', description: spec.description, owner: kind.kind })
+    for (const spec of environment.variables) result.push({ key: spec.key, value: override[spec.key] ?? values[spec.key] ?? '', description: spec.description, owner: kind.kind })
   }
   return result
 }
@@ -38,7 +40,8 @@ export function environmentOf(input: { deployment: Deployment; sources: SourceRe
 /** Combines a ticket's fixed directory, name, and origin trigger with the deployment's current settings. */
 export function ticketEnvironment(input: { deployment: Deployment; sources: SourceRegistry; settings: Settings; ticket: Ticket; trigger?: Trigger }) {
   const { ticket, trigger, ...rest } = input
-  const values = { id: ticket.id, name: ticket.execution?.name ?? '', directory: ticket.execution?.directory ?? '' }
+  const values = { id: ticket.id, name: ticket.execution?.name ?? '', directory: ticket.execution?.directory ?? '',
+    ...ticket.repository ? { repository: ticket.repository } : {} }
   return environmentOf({ ...rest, ticket: values, ...trigger ? { trigger } : {} })
 }
 export function environmentLines(variables: Variable[]): string {

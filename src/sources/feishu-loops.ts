@@ -8,7 +8,7 @@ import { feishuChatLink } from './feishu-channel.ts'
 import type { FeishuBot } from '../deployment.ts'
 import { validItems, type Tally } from '../infra/commands.ts'
 import { readFeishu, type FeishuRef } from './feishu-read.ts'
-import { feishuRef, feishuTime, feishuTrigger, HistoricalMessageSchema, historyEvent, HistoryPageSchema, SOURCE, topicEvent }
+import { feishuRef, feishuTime, feishuTrigger, HistoricalMessageSchema, historyEvent, HistoryPageSchema, isVoiceNote, SOURCE, topicEvent }
   from './feishu-trigger.ts'
 import { health, type SourceContext } from './host.ts'
 import { KV } from '../kv.ts'
@@ -22,6 +22,11 @@ const bot = (ctx: SourceContext): FeishuBot => {
   const resolved = ctx.deployment.feishu
   if (!resolved) throw new Error('The Feishu Source has no working bot CLI')
   return resolved
+}
+/** Answers a voice note with a request for text, so the sender learns why nothing was opened instead of waiting in vain. */
+async function replyVoiceUnsupported(ctx: SourceContext, messageId: string): Promise<void> {
+  await ctx.commands.lark(['im', '+messages-reply', '--message-id', messageId, '--text',
+    '语音消息我这边暂时转不了文字。麻烦你直接发文字，或者用手机输入法的语音转文字发过来。'])
 }
 async function receive(ctx: SourceContext, trigger: Trigger): Promise<void> {
   await ctx.receive(trigger)
@@ -86,7 +91,13 @@ async function consume(ctx: SourceContext, signal: AbortSignal): Promise<void> {
   stdout.on('line', (line: string) => {
     chain = chain.then(async () => {
       if (line.length > 1_048_576) throw new Error('Feishu event exceeds 1 MiB')
-      const trigger = feishuTrigger(JSON.parse(line), bot(ctx).botId, bot(ctx).appId)
+      const event = JSON.parse(line) as { content?: unknown; sender_type?: unknown; message_id?: unknown }
+      // A voice note carries no text we can act on: answer it in place instead of filing a ticket for `{"file_key":…}`.
+      if (typeof event.content === 'string' && event.sender_type === 'user' && isVoiceNote(event.content) && typeof event.message_id === 'string') {
+        await replyVoiceUnsupported(ctx, event.message_id)
+        return
+      }
+      const trigger = feishuTrigger(event, bot(ctx).botId, bot(ctx).appId)
       // Events already read when the Source is disabled are dropped; the consumer stops shortly after.
       if (!trigger || !enabled(ctx)) return
       const chats = ctx.state.get(KV.feishu.chats) ?? {}

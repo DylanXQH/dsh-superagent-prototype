@@ -176,19 +176,21 @@ const STREAMS = [
   { id: 'review-comments', observed: (config: GithubConfig) => config.observeComments, path: 'pulls/comments?' },
 ] as const
 /** Polls repository-wide streams (new Issues/PRs, comments, default-branch CI); each stream reads from when it was switched on, resets when switched off, and fails independently. */
-async function pollRepository(ctx: SourceContext, round: Round): Promise<void> {
+async function pollRepository(ctx: SourceContext, round: Round, repository: string): Promise<void> {
   const config = ctx.config<GithubConfig>(SOURCE)
   if (!config) return
   for (const stream of STREAMS) {
     if (stopped(ctx, round)) return
-    if (!stream.observed(config)) { ctx.state.set(KV.github.stream(stream.id), undefined); continue }
-    try { await readStream(ctx, round, stream.id, stream.path, config) }
-    catch (error) { if (!stopped(ctx, round)) round.failures.push(`${stream.id}: ${String(error)}`) }
+    if (!stream.observed(config)) { ctx.state.set(KV.github.stream(repository, stream.id), undefined); continue }
+    try { await readStream(ctx, round, stream.id, stream.path, config, repository) }
+    catch (error) { if (!stopped(ctx, round)) round.failures.push(`${repository} ${stream.id}: ${String(error)}`) }
   }
+  // Default-branch CI is observed for the primary repository only; each repository is polled on its own cursor and its own path.
+  if (!sameName(repository, ctx.deployment.repository)) return
   // When CI observation is turned off, clear the failure baseline but preserve the revision counter so future triggers have unique IDs.
   if (!config.observeCi) {
-    const seen = ctx.state.get(KV.github.branchCi)
-    ctx.state.set(KV.github.branchCi, seen && { revision: seen.revision })
+    const seen = ctx.state.get(KV.github.branchCi(repository))
+    ctx.state.set(KV.github.branchCi(repository), seen && { revision: seen.revision })
     return
   }
   try { await pollBranchCi(ctx, round) }
@@ -200,8 +202,8 @@ async function pollRepository(ctx: SourceContext, round: Round): Promise<void> {
  * unchanged (including when clamped to the hourly horizon), sending the last page's ETag makes an unchanged list return
  * HTTP 304 and cost no rate limit. Items from before their kind was switched on or beyond the horizon are ignored.
  */
-async function readStream(ctx: SourceContext, round: Round, id: string, path: string, config: GithubConfig): Promise<void> {
-  const name = KV.github.stream(id)
+async function readStream(ctx: SourceContext, round: Round, id: string, path: string, config: GithubConfig, repository: string): Promise<void> {
+  const name = KV.github.stream(repository, id)
   const stored = ctx.state.get(name)
   const kinds = id === 'issues' ? [...config.observeIssues ? ['issues'] : [], ...config.observePulls ? ['pulls'] : []] : ['comments']
   const before = typeof stored?.started === 'object' ? stored.started : {}
@@ -211,7 +213,8 @@ async function readStream(ctx: SourceContext, round: Round, id: string, path: st
   const conditional = stored?.etag && stored.since === since ? ['-H', `If-None-Match: ${stored.etag}`] : []
   let raw: string
   const listed = `${path}&sort=updated&direction=asc&per_page=100&since=${encodeURIComponent(since)}`
-  try { raw = await ctx.commands.withSignal(round.signal).api(listed, '--include', ...conditional) }
+  const scoped = sameName(repository, ctx.deployment.repository) ? ctx.commands : ctx.commands.forRepository(repository)
+  try { raw = await scoped.withSignal(round.signal).api(listed, '--include', ...conditional) }
   catch (error) {
     if (error instanceof CliError && error.code === 304) return
     throw error
@@ -229,7 +232,7 @@ async function readStream(ctx: SourceContext, round: Round, id: string, path: st
       const issue = IssueSchema.safeParse(item)
       const pr = issue.success && !!issue.data.pull_request
       if (!issue.success || !fresh(issue.data.created_at, pr ? 'pulls' : 'issues')) continue
-      await ctx.receive(pr ? pullTrigger(issue.data, login) : issueTrigger(issue.data, login))
+      await ctx.receive(pr ? pullTrigger(issue.data, login, repository) : issueTrigger(issue.data, login, repository))
       nameThread(ctx, issue.data.number, issue.data.title)
       continue
     }
@@ -237,7 +240,7 @@ async function readStream(ctx: SourceContext, round: Round, id: string, path: st
     if (!number || !fresh(item.updated_at ?? item.created_at, 'comments')) continue
     const isPr = id === 'review-comments' || /\/pull\//.test(item.html_url ?? '')
     const ref = { number, isPr, ...item.html_url ? { url: item.html_url } : {} }
-    const trigger = commentTrigger(item, ref, id === 'comments' ? 'conversation' : 'inline', login)
+    const trigger = commentTrigger(item, ref, id === 'comments' ? 'conversation' : 'inline', login, repository)
     if (trigger.text) await ctx.receive(trigger)
   }
   const newest = Math.max(...items.map(item => Date.parse(item.updated_at ?? '')).filter(Number.isFinite))
@@ -253,7 +256,7 @@ async function pollBranchCi(ctx: SourceContext, round: Round): Promise<void> {
   const { default_branch: branch } = await commands.api(z.looseObject({ default_branch: z.string() }), '')
   const head = await commands.api(z.looseObject({ sha: z.string() }), `commits/${encodeURIComponent(branch)}`)
   const snapshot = await pullChecks(commands, head.sha, round.tally)
-  const previous = ctx.state.get(KV.github.branchCi)
+  const previous = ctx.state.get(KV.github.branchCi(ctx.deployment.repository))
   // The first observation after switching on or renaming the default branch establishes the baseline.
   const known = previous?.branch === branch ? previous.failures : undefined
   const failures = ciFailures(snapshot)
@@ -265,10 +268,10 @@ async function pollBranchCi(ctx: SourceContext, round: Round): Promise<void> {
     revision += 1
     const summary = ciSummary(snapshot, branch, `github/commits/${head.sha}/checks`)
     const url = `https://github.com/${ctx.deployment.repository}/commit/${head.sha}`
-    await ctx.receive(branchCiTrigger(branch, head.sha, revision, summary, url))
+    await ctx.receive(branchCiTrigger(branch, head.sha, revision, summary, url, ctx.deployment.repository))
     ctx.threads.describe(`github:ci:${branch}`, { label: `CI on ${branch}`, facts: { ci: ciFact(counts) } })
   }
-  ctx.state.set(KV.github.branchCi, { branch, failures: now, revision })
+  ctx.state.set(KV.github.branchCi(ctx.deployment.repository), { branch, failures: now, revision })
 }
 /**
  * One polling round: notifications, then observed repository streams, then the PRs of open tickets with their CI, then
@@ -280,7 +283,12 @@ async function pollBranchCi(ctx: SourceContext, round: Round): Promise<void> {
 export async function pollRound(ctx: SourceContext, signal?: AbortSignal): Promise<number> {
   const round = newRound(signal)
   const notified = await pollNotifications(ctx, round).then(value => ({ value }), (error: unknown) => ({ error }))
-  await pollRepository(ctx, round)
+  const declared = ctx.deployment.repositories
+  const repositories = declared?.length ? declared : [ctx.deployment.repository]
+  for (const repository of repositories) {
+    if (signal?.aborted) break
+    await pollRepository(ctx, round, repository)
+  }
   await pollTicketPulls(ctx, signal, round)
   await pollThreads(ctx, signal, round)
   if ('error' in notified) throw notified.error

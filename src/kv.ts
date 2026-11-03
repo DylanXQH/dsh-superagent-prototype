@@ -5,6 +5,7 @@
 import type { PromptVersion } from './app/prompts.ts'
 import type { SettingsVersion } from './app/store.ts'
 import type { SettingsSave } from './policy.ts'
+import type { Episode } from './core/model.ts'
 import type { Retry } from './sources/github.ts'
 
 /** Key of a KV record whose value has type `V`; a plain string represents an untyped key. */
@@ -29,6 +30,8 @@ export const KV = {
   prompts: { revision: record<number>('prompt-revision'), version: family<PromptVersion, [revision: number]>('prompt-version:'),
     /** The built-in text of a prompt part an override was edited from, by its `base`, which shows what an upgrade changed. */
     builtIn: family<string, [base: string]>('prompt-built-in:') },
+  /** Episodes: one record per ended ticket, and the newest-first index of which tickets have one. */
+  episodes: { one: family<Episode, [ticketId: string]>('episode:'), index: record<string[]>('episode-index') },
   /** Runtime: the main Session's ID. */
   runtime: { masterId: record<string>('master-id') },
   /** Sessions: prompt revisions each Session has worked under, ordered oldest first; the last entry (`.at(-1)`) is its active revision. */
@@ -44,10 +47,10 @@ export const KV = {
    * counts reported CI changes so each produces a distinct Trigger ID).
    */
   github: { since: record<string>('github-since'), retries: record<Record<string, Retry>>('github-retry'),
-    cursor: family<string, [number: number]>('github-cursor:'),
-    stream: family<{ since: string; started: Record<string, string>; etag?: string }, [stream: string]>('github-stream:'),
-    branchCi: record<{ branch?: string; failures?: string[]; revision: number }>('github-branch-ci'),
-    ci: family<{ fingerprint: string; revision: number }, [number: number]>('github-ci:') },
+    cursor: family<string, [repository: string, number: number]>('github-cursor:'),
+    stream: family<{ since: string; started: Record<string, string>; etag?: string }, [repository: string, stream: string]>('github-stream:'),
+    branchCi: family<{ branch?: string; failures?: string[]; revision: number }, [repository: string]>('github-branch-ci:'),
+    ci: family<{ fingerprint: string; revision: number }, [repository: string, number: number]>('github-ci:') },
   /**
    * Feishu Source: known chats (`true` for direct messages); per-chat history cursor and active topics mapped from topic ID
    * to last-seen timestamp; and per-polled-thread seen message IDs and initialization flag.
@@ -55,4 +58,6 @@ export const KV = {
   feishu: { chats: record<Record<string, boolean>>('feishu-chats'), history: family<string, [chat: string]>('feishu-history:'),
     topics: family<Record<string, string>, [chat: string]>('feishu-history-threads:'),
     seen: family<string[], [thread: string]>('thread-seen:'), initialized: family<boolean, [thread: string]>('thread-initialized:') },
+  /** Mail Source: the mail UIDs already turned into Triggers, so a re-poll does not ingest them twice. */
+  mail: { seen: family<string, [uid: string]>('mail-seen:'), initialized: record<boolean>('mail-initialized') },
 }

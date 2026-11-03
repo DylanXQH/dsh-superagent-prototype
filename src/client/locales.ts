@@ -599,6 +599,7 @@ const TEXT = {
   'reason.channelIgnored': ['来源已不再监听这个对话', 'The Source no longer listens to this conversation'],
   'reason.hostRestarted': ['dsh-superagent 重启', 'dsh-superagent restarted'],
   'reason.retried': ['人工重试', 'Retried by a person'],
+  'reason.heldByStrategy': ['被 {strategy} 分诊策略暂缓', 'Held by the {strategy} triage strategy'],
   'reason.completed': ['已完成', 'Completed'],
   'reason.dropped': ['无需处理，已关闭', 'No action needed; closed'],
   'reason.merged': ['PR 已合并', 'PR merged'],

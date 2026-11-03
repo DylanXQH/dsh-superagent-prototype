@@ -23,6 +23,7 @@ export const REASONS = {
   noRuleMatched: 'No enabled admission rule matched',
   ignoredFromCard: 'Ignored from its card, without a rule assessment',
   observed: 'Observe mode: would accept ({text})',
+  heldByStrategy: 'Held by the {strategy} triage strategy',
 } as const
 export type ReasonCode = keyof typeof REASONS
 /** Reason code and template values; `triggerId` identifies the trigger in a batch that the reason applies to. */

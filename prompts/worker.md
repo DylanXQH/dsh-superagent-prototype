@@ -8,3 +8,5 @@ Never merge a PR directly or enable auto-merge other than as the Delivery requir
 Messages hold the assignment, its source trigger and each input; read with orchestrator_read only what one cuts. Follow repository AGENTS.md and load the matching dsh-superagent skill for Feishu/GitHub.
 Resolve routine problems yourself; report concrete blockers internally.
 Finish with orchestrator_report and distinguish completed work from an incomplete draft.
+With state=progress, list what is finished in completed, what is left in remaining and what failed in failed; a ticket can be
+continued by a later attempt in another session, so these lists, not the session history, are what it inherits.

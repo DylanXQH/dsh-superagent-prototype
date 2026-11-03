@@ -1,7 +1,7 @@
 /** The domain Engine: the single entry point of the core, and the role interfaces its callers receive. */
 import { UserError } from './errors.ts'
 import { isoTime, liveTicket } from './model.ts'
-import type { ChannelRef, Decision, PolicyEffect, ThreadRef, Ticket, Trigger } from './model.ts'
+import type { ChannelRef, Decision, PolicyEffect, StrategyTrace, ThreadRef, Ticket, TicketHold, Trigger } from './model.ts'
 import type { Candidate, Repositories } from './ports.ts'
 import type { EngineOptions } from './part.ts'
 import { Assignments, type WorkerReport } from './assignments.ts'
@@ -63,6 +63,9 @@ export class Engine {
     // Normalize source timestamps (such as GitHub whole seconds) to canonical ISO form.
     this.repo.atomic(() => { this.tickets.threadClosed(thread, outcome, isoTime(at)) })
   }
+
+  /** Appends one decision layer's trace to a ticket's basis chain: assignment and review record theirs after the fact (axiom 5). */
+  noteTrace(ticketId: string, trace: StrategyTrace): void { this.repo.atomic(() => { this.tickets.appendTrace(ticketId, trace) }) }
 
   // The clock
 
@@ -238,6 +241,20 @@ export class Engine {
    */
   report(ticketId: string, report: WorkerReport): Ticket { return this.repo.atomic(() => this.assignments.report(ticketId, report)) }
   /**
+   * The Executor's fact that a ticket waits without a report saying so, such as that no worker has capacity. The hold is
+   * recorded on the ticket (and cleared when the ticket is placed again) so the panel and the main Session can tell
+   * `waiting-resource` from `waiting-human` and `retrying`.
+   */
+  holdTicket(ticketId: string, hold: TicketHold): void { this.repo.atomic(() => { this.tickets.hold(ticketId, hold) }) }
+  /** The Executor's fact that a held ticket got placed, or no longer needs the hold. */
+  clearTicketHold(ticketId: string): void { this.repo.atomic(() => { this.tickets.clearHold(ticketId) }) }
+  /**
+   * The Executor's fact that the worker running a ticket was lost: end that Assignment as `workerLost` and start a new
+   * attempt (a new Session id) on whichever worker has capacity. The ticket, not the session or the machine, is the unit.
+   * @throws UserError when the ticket is unknown, has ended, or has no running Assignment.
+   */
+  recoverTicket(ticketId: string, reason: string, note: string): void { this.repo.atomic(() => { this.tickets.recover(ticketId, reason, note) }) }
+  /**
    * Handles an assignment that was running when the host stopped: restarts it with a recovery note unless its latest report is
    * `waiting`, `ready`, `blocked`, or `failed` and no Input reached its worker after that report, in which case it keeps its
    * Session and state and gets the Inputs that wait for it.
@@ -267,4 +284,5 @@ export type EngineForPeople = Pick<Engine, 'stopTicket' | 'retryTicket' | 'reeva
 export type EngineForSettings = Pick<Engine, 'policyChanged'>
 /** What the Executor tells the Engine, and what its workers ask of it. */
 export type EngineForExecutor = Pick<Engine, 'assignmentStarted' | 'inputsDelivered' | 'inputsRead' | 'turnEnded' | 'deliveryFailed'
-  | 'assignmentInterrupted' | 'report' | 'markUnrelated' | 'handback' | 'followForContext' | 'reply'>
+  | 'assignmentInterrupted' | 'report' | 'markUnrelated' | 'handback' | 'followForContext' | 'reply'
+  | 'holdTicket' | 'clearTicketHold' | 'recoverTicket' | 'noteTrace'>

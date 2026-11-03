@@ -2,16 +2,17 @@
 import { key } from './ids.ts'
 import { UserError } from './errors.ts'
 import { liveTicket, threadKey } from './model.ts'
-import type { Decision, DecisionKind, Evaluation, Mandate, MandateBasis, Strength, Thread, Trigger } from './model.ts'
+import type { Decision, DecisionKind, Evaluation, Mandate, MandateBasis, StrategyTrace, Strength, Thread, Trigger } from './model.ts'
 import type { AssessmentOutcome, Candidate, Policy } from './ports.ts'
 import { said, type Reason } from './reasons.ts'
 import { EnginePart, type EngineOptions } from './part.ts'
+import { builtinStrategies } from './strategies.ts'
 import type { Tickets } from './tickets.ts'
 
 /** An outcome for the Eval that holds a Trigger; `evalId` names the Eval it was judged for, so a later Eval refuses it. */
 export type Outcome = AssessmentOutcome & { evalId?: string }
 /** What an Eval ends with, as its Decision records it. */
-interface Finished { kind: DecisionKind; reason: Reason[]; audit?: Record<string, unknown>; ticketId?: string; mandate?: Mandate }
+interface Finished { kind: DecisionKind; reason: Reason[]; audit?: Record<string, unknown>; ticketId?: string; mandate?: Mandate; trace?: StrategyTrace[] }
 /** An outcome's reason: a code it carries, else the words its assessor or person wrote. */
 const reasonOf = (reason: string | Reason): Reason[] => [typeof reason === 'string' ? said(reason) : reason]
 const stronger = (a: Strength, b: Strength): Strength => a === 'explicit' || b === 'explicit' ? 'explicit' : 'inferred'
@@ -25,6 +26,8 @@ const REQUEUES = 2
  * Engine routes the main Session's decisions, people's replays, worker handbacks, and the pass's Eval work here.
  */
 export class Evals extends EnginePart {
+  /** Strategy implementations this deployment can select; config only names ids (axiom 7). */
+  readonly #strategies = builtinStrategies()
   constructor(options: EngineOptions, private readonly tickets: Tickets) { super(options) }
 
   /**
@@ -300,18 +303,33 @@ export class Evals extends EnginePart {
       this.tickets.end(ticket.id, 'human', 'stopped', this.now(), typeof outcome.reason === 'string' ? outcome.reason : undefined)
       return decision
     }
-    return this.accept(thread, evaluation, outcome)
+    // Triage decides whether an accepted candidate becomes work at all; its facts stay with the Decision (axiom 7).
+    const strategy = this.#strategies.triage(this.policy().strategies.triage)
+    const verdict = strategy.decide({ strength: evaluation.strength, explicit: evaluation.strength === 'explicit',
+      rules: outcome.rules ?? [] })
+    const trace: StrategyTrace = { layer: 'triage', strategy: strategy.id, at: this.now(), outcome: verdict.decision, facts: verdict.facts }
+    if (verdict.decision === 'ignore') return this.finish(thread, evaluation, { kind: 'ignore', trace: [trace],
+      reason: [{ code: 'heldByStrategy', values: { strategy: strategy.id } }], ...audit })
+    return this.accept(thread, evaluation, outcome, trace)
   }
   /** Record an accept with the Mandate the Eval gives, and have Tickets create its ticket. */
-  private accept(thread: Thread, evaluation: Evaluation, outcome: Extract<AssessmentOutcome, { kind: 'accept' }>): Decision {
+  private accept(thread: Thread, evaluation: Evaluation, outcome: Extract<AssessmentOutcome, { kind: 'accept' }>, triageTrace: StrategyTrace): Decision {
     const at = this.now()
+    // Planning fixes the title and scope every later layer works under; a strategy may bound what a ticket is asked for.
+    const planning = this.#strategies.planning(this.policy().strategies.planning)
+    const plan = planning.plan({ title: outcome.title, scope: outcome.scope })
+    const planningTrace: StrategyTrace = { layer: 'planning', strategy: planning.id, at, outcome: 'planned', facts: plan.facts }
     const basis = { ...evaluation.basis, ...(outcome.rules ? { rules: outcome.rules } : {}) }
     const { strength, policyVersion, actor } = evaluation
-    const mandate: Mandate = { strength, policyVersion, basis, actor, scope: outcome.scope }
+    const mandate: Mandate = { strength, policyVersion, basis, actor, scope: plan.scope }
     const ticketId = key('ticket', evaluation.id)
     const audit = outcome.audit ? { audit: outcome.audit } : {}
-    const decision = this.finish(thread, evaluation, { kind: 'accept', reason: reasonOf(outcome.reason), ...audit, mandate, ticketId })
-    this.tickets.create(ticketId, decision.id, mandate, evaluation, outcome, at)
+    const decision = this.finish(thread, evaluation, { kind: 'accept', reason: reasonOf(outcome.reason), ...audit, mandate, ticketId,
+      trace: [triageTrace, planningTrace] })
+    this.tickets.create(ticketId, decision.id, mandate, evaluation, { ...outcome, title: plan.title }, at)
+    // The ticket carries the same basis chain, so it can be read without the Decision history (axiom 5).
+    this.tickets.appendTrace(ticketId, triageTrace)
+    this.tickets.appendTrace(ticketId, planningTrace)
     return decision
   }
   /** Record an Eval's Decision; the Thread's own Eval ends with it, while a gate-only one leaves the Thread's Eval going. */
@@ -328,7 +346,8 @@ export class Evals extends EnginePart {
     const at = this.now()
     const decision: Decision = { id: key('decision', evaluation.id), evalId: evaluation.id, threadKey: thread.key, triggerIds: evaluation.triggerIds,
       policyVersion: evaluation.policyVersion, at, kind: outcome.kind, reason: outcome.reason, strength: evaluation.strength,
-      ...(outcome.ticketId ? { ticketId: outcome.ticketId } : {}), ...(outcome.mandate ? { mandate: outcome.mandate } : {}), ...(outcome.audit ? { audit: outcome.audit } : {}) }
+      ...(outcome.ticketId ? { ticketId: outcome.ticketId } : {}), ...(outcome.mandate ? { mandate: outcome.mandate } : {}), ...(outcome.audit ? { audit: outcome.audit } : {}),
+      ...(outcome.trace ? { trace: outcome.trace } : {}) }
     this.repo.decisions.save(decision)
     for (const id of evaluation.triggerIds) {
       const disposition = this.repo.triggers.disposition(id) ?? { fanout: [], at }

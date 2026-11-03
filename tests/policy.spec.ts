@@ -240,6 +240,7 @@ describe('settings migration', () => {
     expect(saved.policy).toEqual({
       rules: [{ id: 'visual', name: 'V', enabled: true, instruction: 'x' }],
       sources: { feishu: { allowed: [{ id: MEMBER, name: 'Alice' }, { id: 'ou_bob', name: 'Bob' }], syncChat: CHAT, admission: {} }, github: { allowed: [{ id: 'alice' }, { id: 'carol' }], admission: {} } },
+      strategies: { triage: 'default', planning: 'default', assignment: 'least-loaded', review: 'verify', requiredTags: {} },
     })
     expect(saved).toMatchObject({ paused: false, executor: { model: null, maxWorkers: 2, directory: '', prepare: '', blockedCommands: [] } })
     expect(saved.sources.feishu).toEqual({ enabled: true, config: { chats: [], directMessages: true } })
@@ -252,9 +253,13 @@ describe('settings migration', () => {
     expect(migrated).toEqual({
       paused: true,
       sources: { feishu: feishuSource({ chats: [{ chatId: CHAT, listen: 'mentions' }, { chatId: OBSERVED, listen: 'all' }], directMessages: false }), github: { enabled: true, config: { pollSeconds: 120 } } },
-      policy: { rules: [], sources: { feishu: { allowed: [{ id: MEMBER, name: 'A' }], admission: {} }, github: { allowed: [{ id: 'a' }], admission: {} } } },
+      policy: { rules: [], sources: { feishu: { allowed: [{ id: MEMBER, name: 'A' }], admission: {} }, github: { allowed: [{ id: 'a' }], admission: {} } },
+      strategies: { triage: 'default', planning: 'default', assignment: 'least-loaded', review: 'verify', requiredTags: {} },
+      },
       eval: { mode: 'auto', timeoutSeconds: 90, model: { provider: 'p', model: 'm' } },
-      executor: { model: null, maxWorkers: 5, directory: '', prepare: '', blockedCommands: [] },
+      executor: { model: null, maxWorkers: 5, directory: '', prepare: '', blockedCommands: [], placement: 'local',
+        taskKinds: [], defaultTaskKind: 'code-change', workers: [], maintenance: { enabled: false, workdir: '' } },
+      notify: { chatId: '', dailyBrief: true, dailyBriefAt: '09:00', watchdog: true },
     })
     expect(migrateSettings(migrated)).toEqual(migrated)
   })

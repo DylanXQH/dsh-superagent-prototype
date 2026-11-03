@@ -28,6 +28,7 @@ function harness(policyOverrides: Partial<Policy> = {}, { emit, prepareTicket }:
   let version = 'v1', paused = false
   const policy: Policy = {
     get version() { return version }, get paused() { return paused }, evalTimeoutMs: 60_000,
+    strategies: { triage: 'default', planning: 'default', assignment: 'least-loaded', review: 'verify', requiredTags: {} },
     gate: (t, thread) => !t.human ? { admissible: false, reason: 'not human' } : t.actor.id === 'alice' ? { admissible: true, strength: 'explicit', basis: { via: 'listed' } } : thread.subscriptions.length ? { admissible: true, strength: 'inferred', basis: { via: 'followup' } } : { admissible: false, reason: 'not a member' },
     revalidate: () => version !== 'revoked',
     admitsInferred: rules => rules.length > 0,
@@ -1617,5 +1618,96 @@ describe('ignores from the card', () => {
     // Accepting an inferred candidate still takes an assessment's matched rules.
     h.engine.receive(trigger('5', { actor: guest })); h.engine.reevaluate('5'); h.pump()
     expect(() => h.engine.decide('5', { kind: 'accept', title: 'Fix', scope: 'small', reason: 'chat' })).toThrow(new UserError('notExplicit'))
+  })
+})
+
+describe('ticket holds and attempts (axiom 2)', () => {
+  it('records the executor hold for a missing machine, and clears it when placed', () => {
+    const h = harness()
+    const decision = accepted(h)
+    const ticketId = decision.ticketId!
+    expect(h.repo.tickets.get(ticketId)!.hold).toBeUndefined()
+    h.engine.holdTicket(ticketId, { kind: 'waiting-resource', since: '2026-09-23T00:00:05.000Z', detail: 'no worker has free capacity' })
+    expect(h.repo.tickets.get(ticketId)!.hold).toMatchObject({ kind: 'waiting-resource', detail: 'no worker has free capacity' })
+    h.engine.clearTicketHold(ticketId)
+    expect(h.repo.tickets.get(ticketId)!.hold).toBeUndefined()
+  })
+  it('keeps the partial-delivery lists a report says, clipped and bounded', () => {
+    const h = harness()
+    const decision = accepted(h)
+    const ticketId = decision.ticketId!
+    h.engine.report(ticketId, { state: 'progress', summary: 'half', completed: [{ item: 'a' }, { item: 'b', artifact: { kind: 'file', uri: 'artifacts/b.txt' } }],
+      remaining: ['c'], failed: [{ item: 'd', reason: 'no access', retryable: false }] })
+    let ticket = h.repo.tickets.get(ticketId)!
+    expect(runningAssignment(ticket)!.report).toMatchObject({ state: 'progress', completed: [{ item: 'a' }, { item: 'b', artifact: { kind: 'file', uri: 'artifacts/b.txt' } }],
+      remaining: ['c'], failed: [{ item: 'd', reason: 'no access', retryable: false }] })
+    h.engine.report(ticketId, { state: 'progress', summary: 'again', completed: [{ item: '   ' }, { item: 'x'.repeat(900) }], remaining: Array.from({ length: 60 }, (_, i) => `r${i}`) })
+    ticket = h.repo.tickets.get(ticketId)!
+    const report = runningAssignment(ticket)!.report!
+    expect(report.completed).toHaveLength(1)
+    expect(report.completed![0]!.item).toHaveLength(500)
+    expect(report.remaining).toHaveLength(50)
+  })
+  it('replaces a lost attempt with a new session attempt, keeping the ticket and its instructions', () => {
+    const h = harness()
+    const decision = accepted(h)
+    const ticketId = decision.ticketId!
+    h.engine.recoverTicket(ticketId, 'workerLost', 'the machine was lost; continue from the remaining list')
+    const ticket = h.repo.tickets.get(ticketId)!
+    expect(ticket.ended).toBeUndefined()
+    expect(ticket.assignments).toHaveLength(2)
+    expect(ticket.assignments[0]).toMatchObject({ state: 'ended', endedReason: 'workerLost' })
+    expect(ticket.assignments[1]).toMatchObject({ state: 'pending', sessionId: `worker-${ticketId}~a2` })
+    expect(ticket.hold).toMatchObject({ kind: 'retrying' })
+    expect(ticket.inputs.at(-1)).toMatchObject({ kind: 'text', text: 'the machine was lost; continue from the remaining list' })
+    const launched = (h.executor.start as unknown as { mock: { calls: [Ticket, Assignment][] } }).mock.calls.at(-1)!
+    expect(launched[1].sessionId).toBe(`worker-${ticketId}~a2`)
+  })
+  it('refuses to recover a ticket with no running assignment, and to recover an ended ticket', () => {
+    const h = harness()
+    const decision = accepted(h)
+    const ticketId = decision.ticketId!
+    h.engine.report(ticketId, { state: 'ready', summary: 'done' })
+    expect(() => h.engine.recoverTicket(ticketId, 'workerLost', 'note')).toThrow(UserError)
+  })
+})
+
+describe('artifact references (axiom 1)', () => {
+  it('stores only a reference a worker reports, never the content it inlined', () => {
+    const h = harness()
+    const ticketId = accepted(h).ticketId!
+    h.engine.report(ticketId, { state: 'progress', summary: 'write done', completed: [
+      { item: 'notes/a.md', artifact: { kind: 'file', uri: 'worker://w1/notes/a.md', size: 12, content: 'x'.repeat(5000) } as never },
+      { item: 'inline', artifact: { base64: 'a'.repeat(4000) } as never },
+    ] })
+    const report = runningAssignment(h.repo.tickets.get(ticketId)!)!.report!
+    expect(report.completed).toEqual([{ item: 'notes/a.md', artifact: { kind: 'file', uri: 'worker://w1/notes/a.md', size: 12 } }, { item: 'inline' }])
+    expect(JSON.stringify(report)).not.toContain('x'.repeat(100))
+    expect(JSON.stringify(report)).not.toContain('a'.repeat(100))
+  })
+})
+
+describe('basis chain (axiom 5)', () => {
+  it('records the triage and planning layers on the decision and the ticket when a candidate is accepted', () => {
+    const h = harness()
+    const decision = accepted(h)
+    const ticket = h.repo.tickets.get(decision.ticketId!)!
+    expect(ticket.trace?.map(trace => trace.layer)).toEqual(['triage', 'planning'])
+    expect(ticket.trace?.[0]?.strategy).toBe('default')
+    expect(h.repo.decisions.get(decision.id)?.trace?.map(trace => trace.layer)).toEqual(['triage', 'planning'])
+  })
+  it('appends assignment and review traces after the fact and keeps the chain bounded', () => {
+    const h = harness()
+    const decision = accepted(h)
+    const ticketId = decision.ticketId!
+    h.engine.noteTrace(ticketId, { layer: 'assignment', strategy: 'tag-match', at: 'later', outcome: 'cloud-desktop#abc',
+      facts: [{ name: 'required_tags', value: 'zone=cn-shenzhen' }] })
+    expect(h.repo.tickets.get(ticketId)!.trace?.at(-1)?.layer).toBe('assignment')
+    for (let index = 0; index < 60; index += 1) {
+      h.engine.noteTrace(ticketId, { layer: 'review', strategy: 'verify', at: 'later', outcome: 'accepted', facts: [] })
+    }
+    const ticket = h.repo.tickets.get(ticketId)!
+    expect(ticket.trace).toHaveLength(40)
+    expect(ticket.trace?.at(-1)?.layer).toBe('review')
   })
 })

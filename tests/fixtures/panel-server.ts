@@ -292,6 +292,9 @@ const SourceSave = z.object({ enabled: z.boolean(), config: z.unknown() })
 
 const ROUTES: { [K in keyof Api]: Route<K> } = {
   'GET state': { answer: stateView },
+  // 按需回拉只在真机/端到端测试里有内容；面板 fixture 只需满足契约。
+  'GET rpc/sessions/:id/events': { query: ['fromSeq', 'toSeq', 'limit', 'types'],
+    answer: ({ params }) => ({ sessionId: params.id, events: [], hasMore: false, lastSeq: 0 }) },
   'GET overview': { answer: overviewView },
   'GET search': { query: ['q'], answer: async ({ query }) => {
     const q = query.q ?? ''

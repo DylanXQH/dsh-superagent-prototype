@@ -153,6 +153,30 @@ export interface Evaluation {
   pausedAt?: string
 }
 
+/** One fact a decision layer used, recorded with its trace: a name and a short value a person can read. */
+export interface StrategyFact { name: string; value: string }
+/** One layer's decision, kept on the Decision and on the Ticket so the four-step basis chain can be read later. */
+export interface StrategyTrace {
+  layer: 'triage' | 'planning' | 'assignment' | 'review'
+  /** Which registered strategy decided this layer. */
+  strategy: string
+  at: string
+  /** The decision this layer took, in a few words. */
+  outcome: string
+  facts: StrategyFact[]
+}
+/** Selects one strategy per decision layer; `requiredTags` is what the tag-matching assignment strategy filters by. */
+export interface StrategyConfig {
+  triage: string
+  planning: string
+  assignment: string
+  review: string
+  requiredTags: Record<string, string | number | boolean>
+}
+
+/** A worker as the assignment layer sees it: its load against its capacity, and the tags it reports. */
+export interface AssignmentCandidate { id: string; tags: Record<string, string | number | boolean>; load: number; capacity: number }
+
 /** Thread aggregate: consistency boundary of eval, holder of subscriptions and decision history. */
 export interface Thread {
   key: string
@@ -204,6 +228,8 @@ export interface Decision {
   mandate?: Mandate
   /** Assessor-supplied audit data (rule assessments, direction, evidence). */
   audit?: Record<string, unknown>
+  /** The triage and planning layers' decisions, as their strategies recorded them (axiom 5). */
+  trace?: StrategyTrace[]
   /** A person dismissed the problem an unavailable Decision shows. */
   dismissed?: true
 }
@@ -214,15 +240,68 @@ export type AssignmentState = 'pending' | 'running' | 'ended'
  * ready (`ready`), a person must act to unblock or recover it (`blocked` or `failed`), or nothing is left to do (`dropped`).
  */
 export type ReportState = 'progress' | 'waiting' | 'ready' | 'blocked' | 'failed' | 'dropped'
+/**
+ * A reference to one artifact a worker produced. The content stays on the worker (`uri` names it); the router stores
+ * only the reference, so a ticket's history does not carry screenshots, logs or build output.
+ */
+export type ArtifactKind = 'screenshot' | 'build' | 'log' | 'file' | 'diff' | 'report'
+export interface ArtifactRef {
+  kind: ArtifactKind
+  /** How to fetch it from the worker that produced it: `worker://<worker>/<path>`. */
+  uri: string
+  sha256?: string
+  size?: number
+  mime?: string
+  /** Short inline excerpt, not the content. */
+  preview?: string
+}
+const ARTIFACT_KINDS: readonly ArtifactKind[] = ['screenshot', 'build', 'log', 'file', 'diff', 'report']
+const PREVIEW_CHARS = 64 * 1024
+/**
+ * Coerces what a worker sent into an `ArtifactRef`, or undefined when it is not one. Nothing else is stored: a report
+ * that carries an object instead of a reference loses it here, which is what keeps artifact content on the worker.
+ */
+export function normalizeArtifact(value: unknown): ArtifactRef | undefined {
+  if (typeof value !== 'object' || value === null || Array.isArray(value)) return undefined
+  const record = value as Record<string, unknown>
+  const kind = record.kind
+  const uri = record.uri
+  if (typeof kind !== 'string' || !ARTIFACT_KINDS.includes(kind as ArtifactKind)) return undefined
+  if (typeof uri !== 'string' || !uri.trim()) return undefined
+  const ref: ArtifactRef = { kind: kind as ArtifactKind, uri: uri.trim().slice(0, 2048) }
+  if (typeof record.sha256 === 'string' && record.sha256) ref.sha256 = record.sha256.slice(0, 128)
+  if (typeof record.size === 'number' && Number.isFinite(record.size) && record.size >= 0) ref.size = Math.trunc(record.size)
+  if (typeof record.mime === 'string' && record.mime) ref.mime = record.mime.slice(0, 128)
+  if (typeof record.preview === 'string' && record.preview) ref.preview = record.preview.slice(0, PREVIEW_CHARS)
+  return ref
+}
+/**
+ * What a report says about the work itself, for partial delivery: items done (each optionally referencing an
+ * artifact that stays on the worker), items still to do, and items that failed. A ticket may live on across
+ * Assignments precisely so this list can be finished by another attempt.
+ */
+export interface ReportProgress {
+  /** Items finished, in the worker's words; `artifact` is a reference, never the content. */
+  completed?: { item: string; artifact?: ArtifactRef }[]
+  /** Items still to do, in the worker's words; an empty list means nothing is left. */
+  remaining?: string[]
+  /** Items that failed, with the reason and whether another attempt may succeed. */
+  failed?: { item: string; reason: string; retryable: boolean }[]
+}
 /** Binding between a ticket and one executor instance. */
 export interface Assignment {
   id: string
   state: AssignmentState
   createdAt: string
+  /**
+   * The worker Session that runs this attempt. A ticket outlives its sessions: a re-dispatch after a worker was lost
+   * starts a new Session (see `workerSessionIdFor`), so the ticket, not the session, is the durable unit.
+   */
+  sessionId?: string
   startedAt?: string
   endedAt?: string
   endedReason?: string
-  report?: { state: ReportState; summary: string; at: string }
+  report?: { state: ReportState; summary: string; at: string } & ReportProgress
   /** When Inputs last reached the worker; one at or after `report.at` means the worker has been busy with Inputs since that report. */
   deliveredAt?: string
   /**
@@ -273,12 +352,40 @@ export type TicketEndBy = 'executor' | 'human'
 export type TicketOutcome = 'completed' | 'merged' | 'closed' | 'dropped' | 'stopped'
 /** A question for a person; `triggerId` is the human message that raised it, whose conversation it goes back to. */
 export interface Attention { id: string; question: string; triggerId?: string }
+/**
+ * Why a ticket waits without a report saying so. `waiting-resource` means no worker has capacity (it is retried
+ * automatically when one registers); `retrying` means its worker was lost and another attempt is being placed.
+ */
+export type TicketHold = { kind: 'waiting-resource' | 'retrying'; since: string; detail?: string }
+/**
+ * The Session id that runs a ticket's `attempt` (1-based). The first attempt keeps the historical `worker-<ticketId>`
+ * for compatibility; later attempts get a suffix so a ticket can live across several sessions, and the reverse mapping
+ * (`ticketOfWorkerSession`) still recovers the ticket id.
+ */
+export const workerSessionIdFor = (ticketId: string, attempt: number): string =>
+  attempt <= 1 ? `worker-${ticketId}` : `worker-${ticketId}~a${attempt}`
+/** The ticket id a worker Session runs, for any attempt; `undefined` when the id is not a worker Session. */
+export const ticketOfWorkerSession = (sessionId: string): string | undefined => {
+  if (!sessionId.startsWith('worker-')) return undefined
+  const rest = sessionId.slice('worker-'.length)
+  const at = rest.lastIndexOf('~a')
+  if (at < 0) return rest
+  const suffix = rest.slice(at + 2)
+  return suffix.length > 0 && /^\d+$/.test(suffix) ? rest.slice(0, at) : rest
+}
 /** Ticket aggregate: an authorized work item with its assignments, channels, thread bindings, and inputs. */
 export interface Ticket {
   id: string
   title: string
   decisionId: string
   mandate: Mandate
+  /** Why an open ticket is not being worked on right now, when the reason is the Executor's rather than a report's. */
+  hold?: TicketHold
+  /**
+   * The basis chain of its four decision layers (triage, planning, assignment, review): which strategy decided each and
+   * the facts it used, oldest first, bounded so a long-lived ticket cannot grow without limit (axiom 5).
+   */
+  trace?: StrategyTrace[]
   /** The Channels of the messages it was accepted from, which its replies go to. */
   channels: ChannelRef[]
   /** When, by whom, and how the ticket ended, with a person's or the host's reason beyond the outcome; an open ticket has none. */
@@ -301,6 +408,11 @@ export interface Ticket {
   updatedAt: string
   /** The Triggers it was accepted from: the one that started it, and the batch its Eval held. */
   origin: { triggerId: string; triggerIds: string[] }
+  /**
+   * The repository this ticket's work belongs to, when it differs from the deployment's primary repository: the Executor
+   * points the ticket's GitHub environment and prepare command at it. Unset means the primary repository.
+   */
+  repository?: string
   /** What its Executor chose: its short name, directory and assignment text. */
   execution?: Execution
   /** The latest failed delivery of an Input to its worker, until a delivery succeeds. */
@@ -312,9 +424,91 @@ export interface Ticket {
  * Thread closed; the ticket then ends unless its work has not finished (see `Tickets.unfinished`).
  */
 export interface Follow { thread: string; own: boolean; closed?: { at: string; outcome: 'merged' | 'closed' } }
-export interface Execution { name: string; directory: string; assignment: string }
+export interface Execution {
+  name: string
+  directory: string
+  assignment: string
+  /**
+   * The TaskKind this ticket runs under: it decides how the workspace was prepared, how the ready result is delivered
+   * and how a ready report is verified. Absent on tickets accepted before task kinds existed; they run as code-change.
+   */
+  taskKind?: string
+  /** Runs on the router host in `directory` as-is: no workspace clone, and no worker placement. */
+  maintenance?: boolean
+}
 
 /** Whether a ticket is open: it has not ended. */
+/**
+ * P0 memory: one structured, model-free record of a finished ticket.
+ * Written when the ticket ends from facts the Store already holds; it records what happened and nothing else.
+ */
+export interface Episode {
+  /** The ticket it records. */
+  id: string
+  ticketId: string
+  /** The words that started it, as written. */
+  intent: string
+  triggerId: string
+  title?: string
+  /** What its Executor chose as the assignment text. */
+  plan?: string
+  directory?: string
+  outcome: TicketOutcome
+  endedBy: TicketEndBy
+  reason?: string
+  /** Messages that arrived after the first one, in order: what the first request left unsaid. */
+  followUps: string[]
+  /** Questions the worker asked and the answers it recorded. */
+  answers: string[]
+  assignments: number
+  /**
+   * The episode this one redid: an ended ticket on the same thread whose work this one came back to change.
+   * It exists to offset the clarification metric: an agent that stops asking and starts guessing makes
+   * clarifications fall while rework rises, so the two are only meaningful read together.
+   */
+  reworkOf?: string
+  /** How long after the earlier episode this one started; absent when this episode is not a rework. */
+  reworkGapMs?: number
+  createdAt: string
+  endedAt: string
+  durationMs: number
+}
+
+/**
+ * A durable memory entry: something the system may recall to act better later.
+ * `kind` decides what it is used for; only `procedure` entries can change behaviour, and they do so through a gated
+ * prompt/skill change rather than from this record alone.
+ */
+export interface MemoryRecord {
+  id: string
+  scope: 'user' | 'project' | 'env'
+  /** For `env` entries, the worker this fact belongs to (`name#instance`); absent means it holds for any worker. */
+  owner?: string
+  kind: 'preference' | 'convention' | 'fact' | 'procedure'
+  /** Stable identity within its scope, such as `commit-language`; a later entry with the same scope and key supersedes it. */
+  key: string
+  value: string
+  /** 0..1; `inferred` sources are capped low until they are observed or confirmed repeatedly. */
+  confidence: number
+  /**
+   * How the claim reached us, which is also how far it may travel:
+   * `user-said` is the person's own words, `observed-trusted` a probe or a record we produced ourselves,
+   * `observed-untrusted` text that arrived from a channel we do not control (a web page, an issue body) and which
+   * therefore never becomes an M1 entry, `inferred` a guess by a model.
+   */
+  source: 'user-said' | 'observed-trusted' | 'observed-untrusted' | 'inferred'
+  /** Episodes, triggers or messages this claim rests on. */
+  evidence: string[]
+  createdAt: string
+  lastUsedAt?: string
+  useCount: number
+  /** The entry that replaced this one; a superseded entry is kept for history but never recalled as current. */
+  supersededBy?: string
+  /** When a person retracted it; a retracted entry is neither recalled nor used as evidence. */
+  retractedAt?: string
+  ttlDays?: number
+}
+
 export const liveTicket = (ticket: Pick<Ticket, 'ended'>): boolean => !ticket.ended
 /** How a ticket ended. */
 export const ticketOutcome = (ticket: Pick<Ticket, 'ended'>): TicketOutcome | undefined => ticket.ended?.outcome

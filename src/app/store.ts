@@ -1,5 +1,6 @@
 /** SQLite persistence for domain aggregates, key-value state, settings history, and the channel outbox. */
 import { DatabaseSync, type SQLInputValue } from 'node:sqlite'
+import type { MemoryRecord } from '../core/index.ts'
 import { chmodSync, mkdirSync } from 'node:fs'
 import { dirname } from 'node:path'
 import { key, threadKey, type ChannelRef, type Decision, type OutboundMessage, type ReplyStatus, type Repositories, type Thread, type ThreadFact,
@@ -27,6 +28,20 @@ export interface SettingsVersion {
  * Generated columns and partial indexes defining active working sets so passes scan only active rows.
  * Older databases missing a column get it added on open and populated by SQLite from stored JSON rows.
  */
+/**
+ * Rows written before the source split stored `observed`; every one of them was a probe of ours, so they read as
+ * trusted. Normalising on read keeps old databases meaningful without a schema migration.
+ */
+function parseMemory(raw: string): MemoryRecord {
+  const memory = JSON.parse(raw) as MemoryRecord & { source: MemoryRecord['source'] | 'observed' }
+  if (memory.source === 'observed') memory.source = 'observed-trusted'
+  // Rows written before the ceilings existed can exceed them (an early probe carried 0.9). Clamping on read keeps the
+  // stored history intact while making every consumer see the same limits the writer now enforces.
+  const ceiling = memory.source === 'user-said' ? 1 : memory.source === 'observed-trusted' ? 0.75 : 0.6
+  if (memory.confidence > ceiling) memory.confidence = ceiling
+  return memory
+}
+
 const SETS: Record<string, Record<string, string>> = {
   ticket: {
     open: "INTEGER AS (CASE WHEN value -> '$.ended' IS NULL THEN 1 END)",
@@ -77,6 +92,11 @@ export class Store implements Repositories {
             CREATE TABLE IF NOT EXISTS outbox (id TEXT PRIMARY KEY, value TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS trigger_thread (thread TEXT NOT NULL, id TEXT NOT NULL, at TEXT NOT NULL, human INTEGER NOT NULL,
               PRIMARY KEY (thread, id));
+            CREATE TABLE IF NOT EXISTS memory (id TEXT PRIMARY KEY, value TEXT NOT NULL, scope TEXT NOT NULL, kind TEXT NOT NULL,
+              key TEXT NOT NULL DEFAULT '', body TEXT NOT NULL DEFAULT '', at TEXT NOT NULL, confidence REAL NOT NULL DEFAULT 0.5,
+              superseded_by TEXT, retracted_at TEXT, owner TEXT);
+            CREATE INDEX IF NOT EXISTS memory_scope ON memory(scope, at);
+            CREATE INDEX IF NOT EXISTS memory_key ON memory(scope, key);
             CREATE TABLE IF NOT EXISTS effect (kind TEXT NOT NULL, key TEXT NOT NULL, value TEXT NOT NULL, seq INTEGER NOT NULL,
               generation INTEGER NOT NULL DEFAULT 0, attempts INTEGER NOT NULL DEFAULT 0, error TEXT NOT NULL DEFAULT '', due INTEGER NOT NULL,
               since TEXT NOT NULL, PRIMARY KEY (kind, key));
@@ -85,6 +105,11 @@ export class Store implements Repositories {
             CREATE INDEX IF NOT EXISTS decision_thread ON decision(thread);
             CREATE INDEX IF NOT EXISTS effect_due ON effect(kind, due, seq);
           `)
+          // Older databases predate per-worker environment facts; adding a nullable column is idempotent and invisible to
+          // callers that never set it, so the schema version stays put and a rollback remains possible.
+          const memoryColumns = new Set(this.db.prepare('SELECT name FROM pragma_table_xinfo(?)').all('memory').map(row => String(row.name)))
+          if (!memoryColumns.has('owner')) this.db.exec('ALTER TABLE memory ADD COLUMN owner TEXT')
+          this.db.exec('CREATE INDEX IF NOT EXISTS memory_owner ON memory(scope, owner)')
           this.addColumns()
           if (migrating) migrateTo11(this)
           if (version !== SCHEMA_VERSION) this.set(KV.store.schema, SCHEMA_VERSION)
@@ -244,6 +269,50 @@ export class Store implements Repositories {
     get: (id: string): Decision | undefined => { const row = this.db.prepare('SELECT value FROM decision WHERE id=?').get(id); return row ? JSON.parse(String(row.value)) as Decision : undefined },
     save: (decision: Decision): void => { this.db.prepare('INSERT INTO decision VALUES (?,?,?) ON CONFLICT(id) DO UPDATE SET value=excluded.value, thread=excluded.thread').run(decision.id, decision.threadKey, JSON.stringify(decision)) },
     byThread: (threadKeyValue: string): Decision[] => this.db.prepare('SELECT value FROM decision WHERE thread=? ORDER BY rowid').all(threadKeyValue).map(row => JSON.parse(String(row.value)) as Decision),
+  }
+  /**
+   * Durable memory entries: the M1 layer of the memory design. Rows are written through `save` only, so a supersede chain
+   * and a retraction stay auditable; `search` matches the key and value by substring, which suits short Chinese queries.
+   */
+  readonly memories = {
+    get: (id: string): MemoryRecord | undefined => {
+      const row = this.db.prepare('SELECT value FROM memory WHERE id=?').get(id)
+      return row ? parseMemory(String(row.value)) : undefined
+    },
+    save: (memory: MemoryRecord): void => {
+      this.db.prepare(`INSERT INTO memory (id, value, scope, kind, key, body, at, confidence, superseded_by, retracted_at, owner)
+        VALUES (?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET value=excluded.value, scope=excluded.scope, kind=excluded.kind,
+        key=excluded.key, body=excluded.body, at=excluded.at, confidence=excluded.confidence, superseded_by=excluded.superseded_by,
+        retracted_at=excluded.retracted_at, owner=excluded.owner`)
+        .run(memory.id, JSON.stringify(memory), memory.scope, memory.kind, memory.key, `${memory.key}\n${memory.value}`,
+          memory.createdAt, memory.confidence, memory.supersededBy ?? null, memory.retractedAt ?? null, memory.owner ?? null)
+    },
+    /** Current (not superseded, not retracted) entries, optionally narrowed to one scope or kind, newest first. */
+    list: (options: { scope?: MemoryRecord['scope']; kind?: MemoryRecord['kind']; owner?: string; limit?: number } = {}): MemoryRecord[] => {
+      const where = ['superseded_by IS NULL', 'retracted_at IS NULL']
+      const parameters: string[] = []
+      if (options.scope) { where.push('scope=?'); parameters.push(options.scope) }
+      if (options.kind) { where.push('kind=?'); parameters.push(options.kind) }
+      if (options.owner) { where.push('(owner=? OR owner IS NULL)'); parameters.push(options.owner) }
+      const limit = options.limit ?? 200
+      return this.db.prepare(`SELECT value FROM memory WHERE ${where.join(' AND ')} ORDER BY at DESC LIMIT ${limit}`)
+        .all(...parameters).map(row => parseMemory(String(row.value)))
+    },
+    /** Current entries whose key or value contains `text`, newest first; a blank query lists everything. */
+    search: (query: string, options: { scope?: MemoryRecord['scope']; owner?: string; limit?: number } = {}): MemoryRecord[] => {
+      const where = ['superseded_by IS NULL', 'retracted_at IS NULL']
+      const parameters: string[] = []
+      const trimmed = query.trim()
+      if (trimmed) { where.push('body LIKE ?'); parameters.push(`%${trimmed.replace(/[\\%_]/g, match => `\\${match}`)}%`) }
+      if (options.scope) { where.push('scope=?'); parameters.push(options.scope) }
+      if (options.owner) { where.push('(owner=? OR owner IS NULL)'); parameters.push(options.owner) }
+      const limit = options.limit ?? 50
+      return this.db.prepare(`SELECT value FROM memory WHERE ${where.join(' AND ')} ESCAPE '\\' ORDER BY at DESC LIMIT ${limit}`)
+        .all(...parameters).map(row => parseMemory(String(row.value)))
+    },
+    /** Every entry, superseded and retracted ones included, newest first: the audit view. */
+    history: (limit = 200): MemoryRecord[] =>
+      this.db.prepare(`SELECT value FROM memory ORDER BY at DESC LIMIT ${limit}`).all().map(row => parseMemory(String(row.value))),
   }
   /** Read-only queries for management views, orchestrator tools, and source polling (see `storeReads`). */
   readonly read: ReturnType<typeof storeReads>

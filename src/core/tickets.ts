@@ -1,9 +1,9 @@
 /** Tickets: their lifecycle from an accept to their end, their Subscriptions and their Inputs. */
 import { key } from './ids.ts'
 import { UserError } from './errors.ts'
-import { latestAssignment, latestReport, liveTicket, readUntil, runningAssignment, settled, threadKey, waitsForPerson } from './model.ts'
-import type { Assignment, ChannelRef, Evaluation, Follow, Mandate, PolicyEffect, ThreadRef, Ticket, TicketEndBy, TicketInput, TicketOutcome,
-  Trigger, TriggerDisposition } from './model.ts'
+import { latestAssignment, latestReport, liveTicket, readUntil, runningAssignment, settled, threadKey, waitsForPerson, workerSessionIdFor } from './model.ts'
+import type { Assignment, ChannelRef, Evaluation, Follow, Mandate, PolicyEffect, StrategyTrace, ThreadRef, Ticket, TicketEndBy, TicketHold,
+  TicketInput, TicketOutcome, Trigger, TriggerDisposition } from './model.ts'
 import type { AssessmentOutcome } from './ports.ts'
 import { EnginePart, type EngineOptions } from './part.ts'
 import type { Replies } from './replies.ts'
@@ -169,9 +169,10 @@ export class Tickets extends EnginePart {
     const ticket = this.require(ticketId)
     const latest = latestAssignment(ticket)
     if (!canRetry(ticket) || !latest) throw new UserError('notRetryable')
+    delete ticket.hold
     this.endAssignment(ticket, latest, 'retried')
     this.requeueUntaken(ticket, latest)
-    const assignment = this.newAssignment(ticket)
+    const assignment = this.newAssignment(ticket, latest.sessionId ?? workerSessionIdFor(ticket.id, 1))
     ticket.updatedAt = this.now()
     this.repo.tickets.save(ticket)
     this.options.executor.stop(ticket, latest, 'retried')
@@ -260,7 +261,7 @@ export class Tickets extends EnginePart {
     if (first?.kind !== 'trigger') return
     const at = this.now()
     delete ticket.ended; ticket.updatedAt = at
-    const assignment = this.newAssignment(ticket)
+    const assignment = this.newAssignment(ticket, latestAssignment(ticket)?.sessionId ?? workerSessionIdFor(ticket.id, 1))
     // Prepend the resumed marker so it is delivered ahead of the waiting messages.
     const resumed: TicketInput = { id: key('input', ticket.id, 'resumed', first.triggerId), kind: 'resumed', triggerId: first.triggerId, at }
     ticket.inputs.push(resumed); ticket.undelivered.unshift(resumed.id)
@@ -314,11 +315,64 @@ export class Tickets extends EnginePart {
     this.repo.tickets.save(ticket)
     this.letGo(ticket.id, waiting, left)
   }
-  /** Replace a ticket's running Assignment with a new one that receives `note` first, and queue it for launch. */
-  restart(ticket: Ticket, running: Assignment, reason: string, note: string): void {
+  /**
+   * Records why an open ticket is not being worked on without a report saying so, such as that no worker has capacity.
+   * The Executor clears it when the ticket is placed again.
+   * @throws UserError when the ticket is unknown or has ended.
+   */
+  hold(ticketId: string, hold: TicketHold): Ticket {
+    const ticket = this.require(ticketId)
+    if (!liveTicket(ticket)) throw new UserError('ticketEnded')
+    ticket.hold = hold
+    ticket.updatedAt = this.now()
+    this.repo.tickets.save(ticket)
+    return ticket
+  }
+  /** Appends one decision layer's trace to the ticket's basis chain, keeping the newest so a long-lived ticket stays bounded. */
+  appendTrace(ticketId: string, trace: StrategyTrace): Ticket {
+    const ticket = this.require(ticketId)
+    ticket.trace = [...ticket.trace ?? [], trace].slice(-40)
+    ticket.updatedAt = this.now()
+    this.repo.tickets.save(ticket)
+    return ticket
+  }
+  /** Clears the hold of an open ticket, which the Executor does once the ticket is placed again. */
+  clearHold(ticketId: string): Ticket {
+    const ticket = this.require(ticketId)
+    if (!ticket.hold) return ticket
+    delete ticket.hold
+    ticket.updatedAt = this.now()
+    this.repo.tickets.save(ticket)
+    return ticket
+  }
+  /**
+   * Replaces the Assignment a lost worker was running with a new attempt (a new Session id) and queues its launch:
+   * the ticket outlives the machine, which is the whole point of axiom 2. The old Assignment ends as `workerLost`.
+   * @throws UserError when the ticket is unknown, has ended, or has no running Assignment.
+   */
+  recover(ticketId: string, reason: string, note: string): void {
+    const ticket = this.require(ticketId)
+    if (!liveTicket(ticket)) throw new UserError('ticketEnded')
+    const running = runningAssignment(ticket)
+    if (!running) throw new UserError('unknownAssignment')
     this.endAssignment(ticket, running, reason)
     this.requeueUntaken(ticket, running)
-    const assignment = this.newAssignment(ticket)
+    const assignment = this.newAssignment(ticket, workerSessionIdFor(ticket.id, ticket.assignments.length + 1))
+    const at = this.now()
+    const input: TicketInput = { id: key('input', ticket.id, 'recover', assignment.id), kind: 'text', text: note, at }
+    ticket.inputs.push(input); ticket.undelivered.push(input.id); ticket.updatedAt = at
+    ticket.hold = { kind: 'retrying', since: at, detail: reason }
+    // 旧 worker 上的后台工作先停：新 attempt 跑在新机器/新会话上，旧会话的 shell job 与 subagent 不该继续跑。
+    this.options.executor.stop(ticket, running, reason)
+    this.repo.tickets.save(ticket)
+    this.options.executor.start(ticket, assignment)
+  }
+  /** Replace a ticket's running Assignment with a new one that receives `note` first, and queue it for launch. */
+  restart(ticket: Ticket, running: Assignment, reason: string, note: string): void {
+    delete ticket.hold
+    this.endAssignment(ticket, running, reason)
+    this.requeueUntaken(ticket, running)
+    const assignment = this.newAssignment(ticket, running.sessionId ?? workerSessionIdFor(ticket.id, 1))
     const at = this.now()
     const input: TicketInput = { id: key('input', ticket.id, 'restart', assignment.id), kind: 'text', text: note, at }
     ticket.inputs.push(input); ticket.undelivered.push(input.id); ticket.updatedAt = at
@@ -353,7 +407,7 @@ export class Tickets extends EnginePart {
       && (!readBefore(input, until) || ticket.undelivered.includes(input.id)) ? [input.id] : []))
     // An end dated earlier, such as a PR's merge, does not move the ticket's last change back.
     ticket.ended = { at, by, outcome, ...why }; ticket.undelivered = []; ticket.updatedAt = this.now()
-    delete ticket.attention; delete ticket.delivery
+    delete ticket.attention; delete ticket.delivery; delete ticket.hold
     // The Assignments the end stops end with it; the ticket's end says why.
     for (const assignment of stopping) { assignment.state = 'ended'; assignment.endedAt = at }
     this.repo.tickets.save(ticket)
@@ -377,9 +431,12 @@ export class Tickets extends EnginePart {
     const later = ticket.inputs.some(input => input.kind !== 'policy-changed' && Date.parse(input.at) > Date.parse(report?.at ?? ''))
     return report?.state !== 'ready' || ticket.undelivered.length > 0 || later
   }
-  /** Add a pending Assignment; a failed delivery to the one before it no longer concerns the ticket. */
-  private newAssignment(ticket: Ticket): Assignment {
-    const assignment: Assignment = { id: key('assignment', ticket.id, String(ticket.assignments.length)), state: 'pending', createdAt: this.now() }
+  /**
+   * Add a pending Assignment; a failed delivery to the one before it no longer concerns the ticket. It runs in `sessionId`:
+   * a retry or a wake keeps the Session of the attempt it continues, while a recovery from a lost worker starts a new one.
+   */
+  private newAssignment(ticket: Ticket, sessionId: string = workerSessionIdFor(ticket.id, 1)): Assignment {
+    const assignment: Assignment = { id: key('assignment', ticket.id, String(ticket.assignments.length)), state: 'pending', createdAt: this.now(), sessionId }
     ticket.assignments.push(assignment)
     delete ticket.delivery
     return assignment

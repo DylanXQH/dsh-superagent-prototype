@@ -4,9 +4,10 @@ import type { SessionId } from '@deepseek-ai/dsh-session'
 import type { Agent } from '@deepseek-ai/dsh-agent'
 import { mkdir, rmdir, stat } from 'node:fs/promises'
 import { dirname, join } from 'node:path'
-import { key, latestAssignment, latestReport, liveTicket, runningAssignment, threadKey, waitsForPerson } from '../core/index.ts'
-import type { AssessmentOutcome, Assignment, EngineForExecutor, Execution, Executor, Mandate, PolicyEffect, Ticket, TicketInput, Trigger }
-  from '../core/index.ts'
+import { builtinTaskKinds, key, latestAssignment, latestReport, liveTicket, NoWorkerCapacityError, runningAssignment, threadKey,
+  ticketOfWorkerSession, waitsForPerson, workerSessionIdFor } from '../core/index.ts'
+import type { AssessmentOutcome, Assignment, EngineForExecutor, Execution, Executor, Mandate, PolicyEffect, TaskKindRegistry, Ticket,
+  TicketInput, Trigger } from '../core/index.ts'
 import type { Machine } from '../deployment.ts'
 import { runAsWorker, verifyDirectory } from '../infra/environment.ts'
 import type { Settings } from '../policy.ts'
@@ -20,12 +21,24 @@ import type { HealthEntry } from '../infra/health.ts'
 import { cancelled, collectJob, killJobs, runningJobs, stopBackground, stopSubagents, until, untilQuiet } from './background.ts'
 
 const now = (): string => new Date().toISOString()
-/** Returns the worker session ID (`worker-<ticketId>`) for a ticket. */
-export const workerSessionId = (ticketId: string): string => `worker-${ticketId}`
-/** Returns the ticket ID for a worker session ID (`worker-<ticketId>`), or undefined for non-worker sessions. */
-export const ticketOfSession = (sessionId: string): string | undefined => sessionId.startsWith('worker-') ? sessionId.slice('worker-'.length) : undefined
+/** Returns the worker session ID (`worker-<ticketId>`) of a ticket's first attempt; later attempts get `~a<n>`. */
+export const workerSessionId = (ticketId: string): string => workerSessionIdFor(ticketId, 1)
+/** Returns the ticket ID for any worker session ID, first attempt or a later one, or undefined for other sessions. */
+export const ticketOfSession = (sessionId: string): string | undefined => ticketOfWorkerSession(sessionId)
 /** Maximum runtime for a workspace prepare command. */
 const PREPARE_TIMEOUT_MS = 10 * 60_000
+/**
+ * How many attempts a ticket gets before the Executor stops re-placing it. A lost worker is a lost attempt, not a failed
+ * task: the same ticket continues on another machine (or the same one after it comes back) until this many attempts.
+ */
+const MAX_ATTEMPTS = 3
+/** What a new attempt is told when the worker of the previous one was lost. */
+const WORKER_LOST_NOTE = 'The worker that ran the previous attempt at this ticket was lost, so this is a new attempt in a new session. '
+  + 'The ticket, its workspace and any artifacts on that machine are not gone: inspect what the previous attempt left (git status and log, '
+  + 'files, the completed and remaining items of its last report), and do not repeat an external operation that already happened. '
+  + 'Finish the ticket and report its state, with completed, remaining and failed items when the work is partial.'
+/** The built-in task kinds, used when the runtime hosts none (tests and in-process tools). */
+const DEFAULT_TASK_KINDS = builtinTaskKinds()
 /** Maximum transient retry attempts for a launch or worker turn, and the initial backoff before resuming a turn. */
 const TRANSIENT_TRIES = 3, TRANSIENT_BACKOFF_MS = 15_000
 /** How long a worker's background work may run on after its turn ended before it is stopped and the worker reported waiting. */
@@ -61,7 +74,7 @@ export interface ExecutorHost {
   readonly context: Context
   /** Where the Executor reports what happened to Assignments and Inputs. */
   readonly engine: Pick<EngineForExecutor, 'assignmentStarted' | 'inputsDelivered' | 'inputsRead' | 'turnEnded' | 'deliveryFailed' | 'report'
-    | 'assignmentInterrupted'>
+    | 'assignmentInterrupted' | 'holdTicket' | 'clearTicketHold' | 'recoverTicket' | 'noteTrace'>
   readonly store: Pick<Store, 'tickets' | 'triggers' | 'set' | 'settings' | 'atomic' | 'afterCommit'>
   /** Durable effect queue through which launches and input deliveries run. */
   readonly effects: Pick<Effects, 'enqueue' | 'handle'>
@@ -70,7 +83,9 @@ export interface ExecutorHost {
   readonly machine: Pick<Machine, 'stateDir'>
   readonly lifetime: AbortSignal
   /** Session manager for worker sessions and for relaying worker reports to the main Session. */
-  readonly sessions: Pick<Sessions, 'ensure' | 'prompt' | 'promptedId' | 'relay' | 'holds'>
+  readonly sessions: Pick<Sessions, 'ensure' | 'prompt' | 'promptedId' | 'relay' | 'holds' | 'placement'>
+  /** Task kinds this deployment routes and verifies with; absent means the built-in kinds. */
+  readonly taskKinds?: TaskKindRegistry
   closing(): boolean
   /** Whether processing is paused, which holds launches and input deliveries. */
   paused(): boolean
@@ -92,6 +107,18 @@ export function mandateInstructions(mandate: Pick<Mandate, 'strength'>): string 
   return mandate.strength === 'inferred' ? 'This ticket has limited proactive authorization. Independently verify that it is a small change '
     + 'internal to one module within the accepted rule scope. If it requires public-interface or behavior changes, new interaction, product '
     + 'decisions or clarification, stop and report dropped; do not expand scope.' : ''
+}
+/** Words that ask this router to change itself rather than a repository. */
+const MAINTENANCE_ASK = /(装|安装|升级|卸载|更新|配置|重启|install|upgrade|uninstall|reinstall|configure)/i
+/** Words that make a ticket about a repository, which keeps it out of the maintenance lane. */
+const REPOSITORY_ASK = /(github\.com|仓库|repo|pull request|\bPR\b|分支|代码|commit)/i
+
+/** Whether this ticket asks to change the router host itself: it runs there, in its own directory, with no clone and no remote worker. */
+export function maintenanceTicket(ticket: Ticket, settings: Settings, text: string): boolean {
+  if (!settings.executor.maintenance.enabled) return false
+  // A ticket that names a repository is development work even when its wording mentions installing something there.
+  if (ticket.repository) return false
+  return MAINTENANCE_ASK.test(text) && !REPOSITORY_ASK.test(text)
 }
 /** Builds a newly accepted ticket's Execution metadata: its worktree name, workspace directory, and assignment text. */
 export function ticketExecution(ticket: Ticket, outcome: Extract<AssessmentOutcome, { kind: 'accept' }>, settings: Settings,
@@ -236,7 +263,26 @@ export class DshExecutor implements Executor {
   }
   /** Populates a newly accepted ticket's `execution` attributes (worktree name, workspace directory, and assignment text). */
   prepare(ticket: Ticket, outcome: Extract<AssessmentOutcome, { kind: 'accept' }>): Ticket {
-    return { ...ticket, execution: ticketExecution(ticket, outcome, this.host.store.settings(), this.host.machine.stateDir) }
+    const settings = this.host.store.settings()
+    const execution = ticketExecution(ticket, outcome, settings, this.host.machine.stateDir)
+    const trigger = this.host.store.triggers.get(ticket.origin.triggerId)
+    const text = `${ticket.title}\n${trigger?.text ?? ''}`
+    if (!maintenanceTicket(ticket, settings, text)) {
+      // The kind is chosen here, once, and stored on the ticket: the executor's launch path only asks how to prepare.
+      const kind = this.taskKinds().select({ title: ticket.title, text, rules: settings.executor.taskKinds, defaultId: settings.executor.defaultTaskKind })
+      const note = kind.note?.({ ticket, text })
+      return { ...ticket, execution: { ...execution, taskKind: kind.id, assignment: [execution.assignment, note].filter(Boolean).join('\n\n') } }
+    }
+    return {
+      ...ticket,
+      execution: {
+        ...execution,
+        directory: settings.executor.maintenance.workdir || join(this.host.machine.stateDir, 'maintenance'),
+        maintenance: true,
+        taskKind: 'maintenance',
+        assignment: `${execution.assignment}\nHost maintenance: this ticket changes the router itself, so this Session runs on the router host in its own working directory with no repository clone. Edit the router's files where they live. A change to the profile only takes effect after the router restarts, so restart it in the background (\`setsid nohup sh -c 'sleep 5; sudo systemctl restart dsh-superagent-router' >/dev/null 2>&1 &\`) after you report, never before.`,
+      },
+    }
   }
   /**
    * Runs the configured `executor.prepare` command for a new ticket workspace in its parent directory with the ticket's
@@ -244,19 +290,39 @@ export class DshExecutor implements Executor {
    * A failed prepare command throws `PrepareFailed`, which is not retried automatically; an empty directory it left is removed, a non-empty one kept.
    * @throws PrepareFailed with the command's output when the prepare command fails.
    */
+  /** The ticket's execution environment, as a plain map that also travels to a remote worker. */
+  private executionEnv(ticket: Ticket): Record<string, string> {
+    return Object.fromEntries(this.host.environment(ticket).map(variable => [variable.key, variable.value]))
+  }
+
+  /** The task kinds this deployment routes by, with the built-ins as the fallback for hosts that host none. */
+  private taskKinds(): TaskKindRegistry { return this.host.taskKinds ?? DEFAULT_TASK_KINDS }
+  /**
+   * What to send as the remote worker's prepare command: undefined lets the worker run the configured repository
+   * prepare, '' tells it a non-repository task has nothing to clone.
+   */
+  private prepareOverride(ticket: Ticket): string | undefined {
+    return this.taskKinds().resolve(ticket).workspace === 'repository' ? undefined : ''
+  }
+
   private async prepareDirectory(ticket: Ticket): Promise<void> {
+    // The maintenance lane works in the router host's own directories, so a clone step would only fail on an existing directory.
+    if (ticket.execution?.maintenance) return
     const directory = ticket.execution?.directory ?? ''
     await mkdir(dirname(directory), { recursive: true })
-    const command = this.host.store.settings().executor.prepare.trim()
-    const env = Object.fromEntries(this.host.environment(ticket).map(variable => [variable.key, variable.value]))
-    // Enforce a timeout so a hung prepare command (such as on a credential prompt) fails the ticket instead of holding a worker slot indefinitely.
-    const signal = AbortSignal.any([this.host.lifetime, AbortSignal.timeout(PREPARE_TIMEOUT_MS)])
-    if (command) await runAsWorker(this.host.context.subprocess, ['sh', '-c', command], dirname(directory), signal, env)
-      .catch(async (error: unknown) => {
-        // Remove an empty directory left by a failed prepare command so a later retry does not treat it as already prepared.
-        await rmdir(directory).catch(() => { /* Absent, or holding what the command wrote, which the output explains. */ })
-        throw new PrepareFailed(`The prepare command failed: ${error instanceof Error ? error.message : String(error)}`)
-      })
+    // Only a repository task clones: a workspace or analysis task gets an empty directory and no prepare command.
+    if (this.taskKinds().resolve(ticket).workspace === 'repository') {
+      const command = this.host.store.settings().executor.prepare.trim()
+      const env = this.executionEnv(ticket)
+      // Enforce a timeout so a hung prepare command (such as on a credential prompt) fails the ticket instead of holding a worker slot indefinitely.
+      const signal = AbortSignal.any([this.host.lifetime, AbortSignal.timeout(PREPARE_TIMEOUT_MS)])
+      if (command) await runAsWorker(this.host.context.subprocess, ['sh', '-c', command], dirname(directory), signal, env)
+        .catch(async (error: unknown) => {
+          // Remove an empty directory left by a failed prepare command so a later retry does not treat it as already prepared.
+          await rmdir(directory).catch(() => { /* Absent, or holding what the command wrote, which the output explains. */ })
+          throw new PrepareFailed(`The prepare command failed: ${error instanceof Error ? error.message : String(error)}`)
+        })
+    }
     await mkdir(directory, { recursive: true })
     await verifyDirectory(directory, this.host.context.subprocess, this.host.lifetime)
   }
@@ -279,6 +345,9 @@ export class DshExecutor implements Executor {
       // would treat whatever a failed prepare command left behind in the directory as a prepared workspace; instead the
       // ticket is marked failed and waits until new human input or an explicit retry arrives.
       if (this.host.closing() || error instanceof Later) throw error
+      // No worker has capacity: this is a resource wait, not a failure. The ticket waits for a machine and is launched as
+      // soon as one registers (or heartbeats with free capacity), so stopping every worker never fails outstanding work.
+      if (error instanceof NoWorkerCapacityError) { this.holdWaitingResource(ticketId, assignmentId, error); return }
       if (!(error instanceof PrepareFailed) && this.retries(`launch:${assignmentId}`, error)) throw error
       this.launchFailed(ticketId, assignmentId, error)
     } finally { this.slots.free(ticketId) }
@@ -301,7 +370,7 @@ export class DshExecutor implements Executor {
         const inputId = ticket?.undelivered[0]
         if (!ticket || !assignment || inputId === undefined) return
         // Waking an idle worker reserves a slot (including the extra slot reserved for human follow-ups).
-        const sessionId = workerSessionId(ticketId)
+        const sessionId = assignment.sessionId ?? workerSessionId(ticketId)
         if (!woken && !this.running(ticket)) {
           // A person's message wakes its worker ahead of new launches, in the slot kept for it.
           const person = ticket.undelivered.some(id => fromPerson(ticket.inputs.find(item => item.id === id)))
@@ -312,7 +381,7 @@ export class DshExecutor implements Executor {
         try {
           // Recreate the worker session if it was externally deleted.
           if (!this.host.context.agents.get(sessionId as SessionId)) {
-            await this.host.sessions.ensure(sessionId, ticket.execution?.directory ?? '', ticket.title, 'worker')
+            await this.host.sessions.ensure(sessionId, ticket.execution?.directory ?? '', ticket.title, 'worker', this.executionEnv(ticket), ticket.execution?.maintenance === true, this.prepareOverride(ticket))
           }
           if (input) await this.deliverInput(ticket, assignment, input)
         } catch (error) {
@@ -339,7 +408,7 @@ export class DshExecutor implements Executor {
     const message = inputMessage(input, trigger)
     if (message === undefined) return
     const text = message.length > ASSIGNMENT_CHARS ? JSON.stringify(capped(message, ASSIGNMENT_CHARS, inputResource(ticket.id, input.id))) : message
-    await this.host.sessions.prompt(workerSessionId(ticket.id), input.id, text, 'steer', live)
+    await this.host.sessions.prompt(assignment.sessionId ?? workerSessionId(ticket.id), input.id, text, 'steer', live)
   }
   /** Formats a trigger on `ticket` for the worker, including a preview of the replied-to message when the worker has not yet seen it. */
   private async triggerCard(ticket: Ticket, triggerId: string, note?: string): Promise<object | undefined> {
@@ -359,18 +428,18 @@ export class DshExecutor implements Executor {
     const report = assignment.report
     const busy = !!assignment.deliveredAt && !!report && assignment.deliveredAt >= report.at
     const ownTurn = (report?.state === 'ready' || report?.state === 'dropped') && !busy
-    const sessionId = workerSessionId(ticket.id)
+    const sessionId = assignment.sessionId ?? workerSessionId(ticket.id)
     this.host.store.afterCommit(() => {
       this.settling.get(ticket.id)?.abort()
       if (!ownTurn) this.host.context.agents.get(sessionId as SessionId)?.cancel({ kind: 'user' }, { keepInbox: false })
       // Its shell jobs and subagents stop with it, also those of a worker that ends its own turn.
-      this.stopWork(ticket.id, reason)
+      this.stopWork(ticket.id, sessionId, reason)
       this.left.get(ticket.id)?.collect.abort(); this.left.delete(ticket.id); this.personal.delete(ticket.id)
     })
   }
-  /** Stop what a ticket's worker runs in the background (see `stopBackground`). */
-  private stopWork(ticketId: string, reason: string, keepInbox = false): void {
-    this.track(ticketId, stopBackground(this.host.context, workerSessionId(ticketId), reason, keepInbox))
+  /** Stop what a ticket's attempt runs in the background (see `stopBackground`). */
+  private stopWork(ticketId: string, sessionId: string, reason: string, keepInbox = false): void {
+    this.track(ticketId, stopBackground(this.host.context, sessionId, reason, keepInbox))
   }
   /** A stop of a ticket's background work, which a launch or a delivery of the ticket waits for while it runs. */
   private track(ticketId: string, stop: Promise<void>): void {
@@ -389,7 +458,12 @@ export class DshExecutor implements Executor {
    * of the jobs left to a person, which were killed, and cancel a worker turn that started meanwhile, keeping its inbox.
    */
   async shutdown(): Promise<void> {
-    const agents = this.host.store.tickets.list().map(ticket => this.host.context.agents.get(workerSessionId(ticket.id) as SessionId))
+    const sessionIds = new Set<string>()
+    for (const ticket of this.host.store.tickets.list()) {
+      sessionIds.add(workerSessionId(ticket.id))
+      for (const assignment of ticket.assignments) if (assignment.sessionId) sessionIds.add(assignment.sessionId)
+    }
+    const agents = [...sessionIds].map(sessionId => this.host.context.agents.get(sessionId as SessionId))
       .filter((agent): agent is Agent => agent !== undefined)
     const stop = async () => {
       await Promise.allSettled(agents.map(agent => stopBackground(this.host.context, agent.id, 'dsh-superagent stopped', true)))
@@ -404,8 +478,10 @@ export class DshExecutor implements Executor {
   activeCount(): number { return this.host.store.tickets.open().filter(ticket => this.running(ticket)).length }
   /** Whether a ticket's worker holds a worker slot: its turn runs, or its shell jobs or subagents do after its turn ended. */
   private running(ticket: Ticket): boolean {
-    if (!runningAssignment(ticket)) return false
-    return this.host.context.agents.get(workerSessionId(ticket.id) as SessionId)?.status === 'running' || this.settling.has(ticket.id)
+    const running = runningAssignment(ticket)
+    if (!running) return false
+    return this.host.context.agents.get((running.sessionId ?? workerSessionId(ticket.id)) as SessionId)?.status === 'running'
+      || this.settling.has(ticket.id)
   }
   /** Marks a ticket failed after its launch fails; the ticket waits until new human input or an explicit retry arrives. */
   private launchFailed(ticketId: string, assignmentId: string, error: unknown): void {
@@ -421,6 +497,48 @@ export class DshExecutor implements Executor {
     })
   }
   private relay({ id, text }: { id: string; text: string }): void { this.host.sessions.relay(id, text) }
+  /**
+   * Records that a launch could not be placed because no worker has capacity. Unlike a failure this is retried
+   * automatically: `retryWaitingResource` runs whenever a worker registers or heartbeats with free capacity.
+   */
+  private holdWaitingResource(ticketId: string, assignmentId: string, error: NoWorkerCapacityError): void {
+    const ticket = this.host.store.tickets.get(ticketId)
+    if (!ticket || !liveTicket(ticket) || latestAssignment(ticket)?.id !== assignmentId) return
+    this.host.engine.holdTicket(ticketId, { kind: 'waiting-resource', since: now(), detail: error.message.slice(0, 300) })
+  }
+  /** Places tickets held for lack of a worker; called when a worker registers or reports free capacity. */
+  retryWaitingResource(): void {
+    for (const ticket of this.host.store.tickets.open()) {
+      if (ticket.hold?.kind !== 'waiting-resource') continue
+      const assignment = latestAssignment(ticket)
+      if (!assignment || assignment.state !== 'pending') { this.host.engine.clearTicketHold(ticket.id); continue }
+      // Clear the hold before starting: a launch that again finds no capacity records a fresh hold.
+      this.host.engine.clearTicketHold(ticket.id)
+      this.start(ticket, assignment)
+    }
+  }
+  /**
+   * The router learned that the workers hosting `sessionIds` are gone. A lost worker ends an attempt, not the ticket:
+   * unless the ticket already used its attempts, the lost attempt is closed as `workerLost` and a new Session is placed on
+   * whichever worker has capacity. The machine is an attempt, not the owner of the task.
+   */
+  handleWorkerLost(sessionIds: readonly string[]): void {
+    for (const sessionId of sessionIds) {
+      const ticketId = ticketOfSession(sessionId)
+      if (!ticketId) continue
+      const ticket = this.host.store.tickets.get(ticketId)
+      if (!ticket || !liveTicket(ticket)) continue
+      const running = runningAssignment(ticket)
+      // A session that is not the ticket's current attempt (an earlier one) has nothing left to recover.
+      if (!running || (running.sessionId ?? workerSessionId(ticket.id)) !== sessionId) continue
+      if (ticket.assignments.length >= MAX_ATTEMPTS) {
+        this.failed(ticketId, `执行这台任务的 worker 已连续 ${MAX_ATTEMPTS} 次丢失（最近一次是 ${sessionId}），不再自动重派。`
+          + `请先检查那台机器；恢复后可以让我重跑，已完成的条目可以作为部分交付保留。`)
+        continue
+      }
+      this.host.engine.recoverTicket(ticketId, 'workerLost', WORKER_LOST_NOTE)
+    }
+  }
   private async launch(ticket: Ticket, assignment: Assignment): Promise<void> {
     const current = () => {
       if (this.host.closing()) throw new Error('dsh-superagent is stopping')
@@ -432,13 +550,17 @@ export class DshExecutor implements Executor {
     const workspace = ticket.execution?.directory ?? ''
     if (!current()) return
     // Prepare the workspace directory once; an existing directory counts as already prepared, including worktrees created before `prepare` commands existed.
-    if (!await stat(workspace).then(() => true, () => false)) {
+    // 异地 worker 例外：目录必须在 worker 本机准备。若路由器这边也跑一遍 prepare，会在自己的磁盘上
+    // clone 出一份非空目录，worker 再 clone 同一路径就会 `destination path already exists` 直接失败。
+    const remotePlacement = this.host.store.settings().executor.placement === 'remote'
+    if (!remotePlacement && !await stat(workspace).then(() => true, () => false)) {
       await this.prepareDirectory(ticket)
       if (!current()) return
     }
     if (!current()) return
-    const sessionId = workerSessionId(ticket.id)
-    const agent = await this.host.sessions.ensure(sessionId, workspace, ticket.title, 'worker')
+    // A later attempt runs in its own Session (`~a<n>`), because the Session of a lost worker died with that machine.
+    const sessionId = assignment.sessionId ?? workerSessionId(ticket.id)
+    const agent = await this.host.sessions.ensure(sessionId, workspace, ticket.title, 'worker', this.executionEnv(ticket), ticket.execution?.maintenance === true, this.prepareOverride(ticket))
     if (!current()) return
     // The background work of the Assignment this one replaces stops first, so its end does not clear this one's message.
     await this.stopped(ticket.id)
@@ -467,6 +589,14 @@ export class DshExecutor implements Executor {
       () => { if (!current()) throw new Error('Launch authorization changed before worker delivery') },
       () => { this.host.engine.assignmentStarted(ticket.id, assignment.id) })
     this.host.engine.assignmentStarted(ticket.id, assignment.id)
+    // 公理 5 + 公理 7：把「谁被哪条策略选中、依据什么事实」写进票据的依据链，事后可解释。
+    const placement = this.host.sessions.placement(sessionId)
+    if (placement) {
+      this.host.engine.noteTrace(ticket.id, { layer: 'assignment', strategy: placement.strategy, at: new Date().toISOString(),
+        outcome: (agent as { workerId?: string }).workerId ?? 'local', facts: placement.facts })
+    }
+    // The attempt is running, so any hold (waiting for a machine, or retrying after a lost one) no longer applies.
+    this.host.engine.clearTicketHold(ticket.id)
   }
   /** Returns the stored ticket for `agent` when it is a worker session, or undefined otherwise. */
   private ticketOf(agent: Agent): Ticket | undefined {
@@ -528,8 +658,9 @@ export class DshExecutor implements Executor {
       if (running) {
         // A restart within this process left DSH's Sessions, jobs and subagents running: they stop first. The inbox keeps an
         // Input that was handed over but not yet taken.
-        this.host.context.agents.get(workerSessionId(ticket.id) as SessionId)?.cancel({ kind: 'user' }, { keepInbox: true })
-        this.stopWork(ticket.id, 'dsh-superagent restarted', true)
+        const sessionId = running.sessionId ?? workerSessionId(ticket.id)
+        this.host.context.agents.get(sessionId as SessionId)?.cancel({ kind: 'user' }, { keepInbox: true })
+        this.stopWork(ticket.id, sessionId, 'dsh-superagent restarted', true)
         this.host.engine.assignmentInterrupted(ticket.id, running.id)
       }
       else if (latest?.state === 'pending' && !waitsForPerson(ticket)) this.start(ticket, latest)
@@ -586,7 +717,8 @@ export class DshExecutor implements Executor {
    * collected, so none wakes the worker outside a slot, and the worker reads of each at its next turn.
    */
   private handOff(ticketId: string, agent: Agent): void {
-    this.track(ticketId, stopSubagents(this.host.context, agent, true))
+    // A remote Session's subagents live in the worker process: there is nothing local to drain.
+    if (!(agent as { remote?: boolean }).remote) this.track(ticketId, stopSubagents(this.host.context, agent, true))
     const left = this.left.get(ticketId) ?? { jobs: new Set<string>(), collect: new AbortController() }
     this.left.set(ticketId, left)
     for (const job of runningJobs(this.host.context, agent.id, left.jobs)) {

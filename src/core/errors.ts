@@ -59,3 +59,16 @@ export class UserError extends Error {
     this.missing = kind === 'missing'
   }
 }
+
+/**
+ * Thrown when `executor.placement` is `remote` but no registered worker has free capacity. The Executor tells this apart
+ * from a real failure: the ticket waits in `waiting-resource` and is launched automatically once a worker registers.
+ */
+export class NoWorkerCapacityError extends Error {
+  readonly workerStates: string[]
+  constructor(detail: string, workerStates: string[]) {
+    super(`executor.placement is "remote" but no worker has free capacity (${detail})`)
+    this.name = 'NoWorkerCapacityError'
+    this.workerStates = workerStates
+  }
+}

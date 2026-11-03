@@ -1,6 +1,6 @@
 /** Shared view projections for triggers, tickets, threads, decisions, and channel links. */
 import { z } from 'zod'
-import { canRetry, followupOwners, latestReport, liveTicket, settled, threadKey, ticketStage, type ActorRef, type ChannelRef, type Decision,
+import { canRetry, followupOwners, latestAssignment, latestReport, liveTicket, settled, threadKey, ticketStage, type ActorRef, type ChannelRef, type Decision,
   type DecisionKind, type Thread, type ThreadFacts, type Ticket, type TicketStage, type Trigger } from '../../core/index.ts'
 import { allowedSender, listedBot } from '../../policy.ts'
 import type { ChannelLink, Localized } from '../../sources/kind.ts'
@@ -108,6 +108,9 @@ export function triggerView(view: Snapshot, trigger: Trigger, threadDecisions?: 
 export type TriggerView = ReturnType<typeof triggerView>
 /** Single-line summary of why a ticket in the `person` stage is waiting on human action (omitted once answered and back with the Executor). */
 function ticketNote(ticket: Ticket, stage: TicketStage): { text: string; error: boolean } | undefined {
+  // A hold is not a failure: a queued ticket whose ticket outlives the Session keeps its blocked reason visible.
+  if (ticket.hold?.kind === 'waiting-resource') return { text: 'Waiting for a worker with free capacity; this is not a failure and starts by itself.', error: false }
+  if (ticket.hold?.kind === 'retrying') return { text: 'The previous worker was lost; this ticket is being retried in a new Session.', error: false }
   if (stage.stage !== 'person') return undefined
   if (stage.action === 'answer' && ticket.attention) return { text: preview(ticket.attention.question), error: false }
   if (stage.action === 'delivery' && ticket.delivery) return { text: preview(ticket.delivery.error), error: true }
@@ -123,9 +126,10 @@ export function ticketSummary(ticket: Ticket) {
     actions: { retry: canRetry(ticket), stop: liveTicket(ticket) }, strength: ticket.mandate.strength, ended: ticket.ended,
     attention: ticket.attention && { ...ticket.attention, question: markdown(ticket.attention.question) },
       assignments: ticket.assignments.length, inputs: ticket.inputs.length, undelivered: ticket.undelivered.length,
-    // Every started Assignment of a Ticket runs in its one shared worker Session.
+    // A ticket outlives a Session: show the Session of its latest started Assignment, which changes per attempt (axiom 2).
     deliveryError: attribute(ticket.delivery?.error), sessionId: ticket.assignments.some(item => item.startedAt)
-      ? workerSessionId(ticket.id) : '',
+      ? latestAssignment(ticket)?.sessionId ?? workerSessionId(ticket.id) : '',
+    ...ticket.hold ? { hold: ticket.hold } : {},
     directory: attribute(ticket.execution?.directory), summary: latestReport(ticket)?.summary ?? '', createdAt: ticket.createdAt,
     updatedAt: ticket.updatedAt }
 }

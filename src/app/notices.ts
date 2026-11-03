@@ -1,6 +1,6 @@
 /** Formats background notices and steering relays delivered to the main Session via the effect queue. */
 import { randomUUID } from 'node:crypto'
-import { followupOwners, key, liveTicket, type DomainEvent, type Ticket, type WorkerReport } from '../core/index.ts'
+import { followupOwners, key, liveTicket, type DomainEvent, type OutboundMessage, type Ticket, type WorkerReport } from '../core/index.ts'
 import { triggerMessage } from '../executor/dsh.ts'
 import type { SourceRegistry } from '../sources/registry.ts'
 import { repliedTo } from './links.ts'
@@ -126,4 +126,22 @@ export function reportRelay(ticket: Ticket, report: Pick<WorkerReport, 'state' |
   }
   if (report.state === 'progress' && !report.answers) return undefined
   return resultRelay(ticket, report.state, report.summary, report.answers)
+}
+
+/**
+ * Builds the message a ticket sends the person who asked for it once its worker reports ready: a ready outcome waits
+ * for a person, and a panel nobody is watching is how finished work sits unnoticed.
+ */
+export function deliveryNotice(ticket: Ticket, pull?: { number: number; url?: string }): OutboundMessage | undefined {
+  const channel = ticket.channels.at(-1)
+  if (!channel) return undefined
+  const title = (ticket.title ?? ticket.intent).replace(/\s+/g, ' ').trim().slice(0, 80)
+  const summary = (ticket.summary ?? '').replace(/\s+/g, ' ').trim().slice(0, 300)
+  const where = pull ? `PR #${pull.number}${pull.url ? ` ${pull.url}` : ''}` : '没有改动需要合并'
+  // Every finished ticket is reported to the person on Feishu; the intake channel only decides where the
+  // router may still reply. A mail ticket therefore gets a Feishu notice and no email (see `Runtime.sendNotice`).
+  return {
+    id: key('delivery', ticket.id), channel, kind: 'notice', ticketId: ticket.id,
+    text: `✅ 任务完成：${title}${summary ? `\n${summary}` : ''}\n${where}\n回复「合并」或「看下」继续；不回复就先停在这里。`,
+  }
 }

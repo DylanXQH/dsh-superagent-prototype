@@ -61,10 +61,17 @@ export class Commands {
    * @param resolved - returns the resolved deployment setup, or throws while setup is still pending.
    * @param environment - variables overriding `process.env` for every command (such as isolated git settings).
    */
-  constructor(private readonly resolved: () => Deployment, private readonly environment: Record<string, string | undefined>, private readonly signal: AbortSignal) {}
+  constructor(private readonly resolved: () => Deployment, private readonly environment: Record<string, string | undefined>,
+    private readonly signal: AbortSignal, private readonly target?: string) {}
   get deployment(): Deployment { return this.resolved() }
-  get repository(): string { return this.deployment.repository }
-  withSignal(signal?: AbortSignal): Commands { return signal ? new Commands(this.resolved, this.environment, AbortSignal.any([this.signal, signal])) : this }
+  /** The repository this instance calls, which is the deployment's primary one unless `forRepository` narrowed it. */
+  get repository(): string { return this.target ?? this.deployment.repository }
+  withSignal(signal?: AbortSignal): Commands { return signal ? new Commands(this.resolved, this.environment, AbortSignal.any([this.signal, signal]), this.target) : this }
+  /** Returns an instance whose API calls are scoped to another repository the deployment serves, so every URL keeps the `repos/<owner>/<name>/` prefix exactly once. */
+  forRepository(repository: string): Commands {
+    if (this.target === repository) return this
+    return new Commands(this.resolved, this.environment, this.signal, repository)
+  }
   async run(program: string, args: string[], cwd?: string): Promise<string> {
     try {
       const { stdout } = await exec(program, args, { cwd, signal: this.signal, timeout: TIMEOUT_MS, maxBuffer: 16 * 1024 * 1024,

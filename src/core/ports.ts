@@ -1,5 +1,5 @@
 /** Ports the core depends on. Sources, policies, assessors, executors, and channels are project-specific. */
-import type { Assignment, ChannelRef, Decision, DecisionKind, Mandate, MandateBasis, Strength, Thread, Ticket, TicketEndBy, TicketOutcome, Trigger }
+import type { Assignment, ChannelRef, Decision, DecisionKind, Mandate, MandateBasis, StrategyConfig, Strength, Thread, Ticket, TicketEndBy, TicketOutcome, Trigger }
   from './model.ts'
 import type { Reason } from './reasons.ts'
 
@@ -24,6 +24,8 @@ export interface Policy {
   admitsInferred(rules: readonly string[]): boolean
   /** How long an assessor may take before an eval is recorded as unavailable. */
   evalTimeoutMs: number
+  /** Which strategy decides each of the four layers (triage, planning, assignment, review). */
+  strategies: StrategyConfig
 }
 
 /** What the assessor receives: bounded facts, never authority. */

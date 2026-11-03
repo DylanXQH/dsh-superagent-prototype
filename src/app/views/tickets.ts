@@ -76,7 +76,13 @@ export function ticketDetail(host: ViewHost, id: string) {
     channels: ticket.channels.map(channel => channelLink(view, channel)),
     decision: decision ? decisionView(view, decision) : undefined,
     // Every started Assignment ran in the ticket's one worker Session. A running assignment whose worker reported a non-progress state has finished its turn unless a human response resumed the ticket.
-    assignments: ticket.assignments.map(assignment => ({ ...assignment, ...assignment.startedAt ? { ref: workerSessionId(ticket.id) } : {},
+    ...ticket.hold ? { hold: ticket.hold } : {},
+    // 公理 5：四层决策的依据链，随票据详情返回，供人说清「为什么这样派/这样收」。
+    ...ticket.trace ? { trace: ticket.trace } : {},
+    // The task kind chosen when the ticket was prepared decides which prepare/deliver/verify seam it ran (axiom 1).
+    ...ticket.execution ? { execution: { name: ticket.execution.name, directory: ticket.execution.directory,
+      ...ticket.execution.taskKind ? { taskKind: ticket.execution.taskKind } : {} } } : {},
+    assignments: ticket.assignments.map(assignment => ({ ...assignment, ...assignment.startedAt ? { ref: assignment.sessionId ?? workerSessionId(ticket.id) } : {},
       ...assignment.state === 'running' && assignment.report && assignment.report.state !== 'progress' && stage !== 'working'
         ? { turnEndedAt: assignment.report.at } : {} })),
     inputs: ticket.inputs.slice().reverse().map(input),

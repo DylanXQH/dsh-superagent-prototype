@@ -76,14 +76,31 @@ export const AdmissionRowSchema: z.ZodType<AdmissionRow> = z.object({ listedUnad
 export const AdmissionTableSchema = z.record(z.string(), AdmissionRowSchema)
 export const SourcePolicySchema = z.object({ allowed: z.array(AllowedSchema).default([]), admission: AdmissionTableSchema.default({}) }).catchall(z.unknown())
 export type SourcePolicy = z.infer<typeof SourcePolicySchema>
+/** Strategy selection per decision layer (axiom 7): a deployment picks an id per layer and registers implementations in code. */
+export const StrategyConfigSchema = z.object({
+  triage: z.string().trim().min(1).default('default'),
+  planning: z.string().trim().min(1).default('default'),
+  assignment: z.string().trim().min(1).default('least-loaded'),
+  review: z.string().trim().min(1).default('verify'),
+  /** Tags the tag-matching assignment strategy requires a worker to report; empty means it never filters. */
+  requiredTags: z.record(z.string(), z.union([z.string(), z.number(), z.boolean()])).default({}),
+}).strict()
 export const PolicyConfigSchema = z.object({
   rules: z.array(RuleSchema).refine(rules => new Set(rules.map(rule => rule.id)).size === rules.length, 'Duplicate rule IDs').default(DEFAULT_RULES),
   sources: z.record(z.string().regex(/^[a-z][a-z0-9-]*$/), SourcePolicySchema).default({}),
+  strategies: StrategyConfigSchema.default(() => StrategyConfigSchema.parse({})),
 }).strict()
 export const EvalConfigSchema = z.object({
   mode: z.enum(['off', 'observe', 'auto']).default('observe'),
   timeoutSeconds: z.number().int().min(LIMITS.evalTimeoutSeconds.min).max(LIMITS.evalTimeoutSeconds.max).default(120),
   model: RoleModelSchema.nullable().default(null),
+}).strict()
+/** The host-maintenance lane: tickets that change this router itself rather than a repository. */
+export const MaintenanceConfigSchema = z.object({
+  /** Whether tickets that ask to install, upgrade or reconfigure this router run on the router host instead of a worker. */
+  enabled: z.boolean().default(false),
+  /** The directory it works in, absolute; empty means `<stateDir>/maintenance`. */
+  workdir: z.string().trim().refine(path => path === '' || path.startsWith('/'), 'An absolute path, or empty for <stateDir>/maintenance').default(''),
 }).strict()
 const CommandNameSchema = z.string().regex(/^[A-Za-z0-9._-]+$/).refine(name => name !== '.' && name !== '..', 'Not a command name')
   .refine(name => !WORKER_COMMANDS.includes(name), `${WORKER_COMMANDS.join(', ')} cannot be blocked`)
@@ -91,9 +108,33 @@ const CommandNameSchema = z.string().regex(/^[A-Za-z0-9._-]+$/).refine(name => n
 export const ExecutorConfigSchema = z.object({
   model: RoleModelSchema.nullable().default(null),
   maxWorkers: z.number().int().min(LIMITS.maxWorkers.min).max(LIMITS.maxWorkers.max).default(3),
+  /** Where worker Sessions run: in this process (`local`) or on a registered remote worker (`remote`). */
+  placement: z.enum(['local', 'remote']).default('local'),
+  /** Remote worker ids allowed to take work; empty means any registered worker. */
+  workers: z.array(z.string()).default([]),
   directory: z.string().trim().refine(path => path === '' || path.startsWith('/'), 'An absolute path, or empty for <stateDir>/work').default(''),
   prepare: z.string().max(LIMITS.prepareCommand).default(''),
+  /**
+   * Routing rules from request phrases to task kinds, in order. They decide how a ticket is prepared, delivered and
+   * verified; adding a task kind needs one TaskKind implementation and one rule here, not an executor change.
+   */
+  taskKinds: z.array(z.object({ id: z.string().trim().min(1), match: z.array(z.string().trim().min(1)).default([]) }).strict()).default([]),
+  /** The task kind a request that matches no rule runs under: development work unless configured otherwise. */
+  defaultTaskKind: z.string().trim().min(1).default('code-change'),
   blockedCommands: z.array(CommandNameSchema).default([]),
+  /** Tickets that change this router itself run on the router host, without a workspace clone. */
+  maintenance: MaintenanceConfigSchema.default(() => MaintenanceConfigSchema.parse({})),
+}).strict()
+/** Proactive notices the router sends on its own schedule: the daily brief, and the watchdog's stall reports. */
+export const NotifyConfigSchema = z.object({
+  /** The Feishu chat that receives them, `oc_…`; empty turns the scheduled notices off. */
+  chatId: z.string().trim().default(''),
+  /** Whether the daily brief is sent. */
+  dailyBrief: z.boolean().default(true),
+  /** Local time of the daily brief, `HH:MM`. */
+  dailyBriefAt: z.string().regex(/^([01]\d|2[0-3]):[0-5]\d$/, 'HH:MM').default('09:00'),
+  /** Whether the watchdog reports Sessions that stop making progress. */
+  watchdog: z.boolean().default(true),
 }).strict()
 export const SourceInstanceSchema = z.object({ enabled: z.boolean().default(true), config: z.record(z.string(), z.unknown()).default({}) }).strict()
 export const SettingsSchema = z.object({
@@ -102,9 +143,10 @@ export const SettingsSchema = z.object({
   policy: PolicyConfigSchema.default(() => PolicyConfigSchema.parse({})),
   eval: EvalConfigSchema.default(() => EvalConfigSchema.parse({})),
   executor: ExecutorConfigSchema.default(() => ExecutorConfigSchema.parse({})),
+  notify: NotifyConfigSchema.default(() => NotifyConfigSchema.parse({})),
 }).strict()
 export type Settings = z.infer<typeof SettingsSchema>
-export type SettingsBlock = 'policy' | 'eval' | 'executor' | `source:${string}`
+export type SettingsBlock = 'policy' | 'eval' | 'executor' | 'notify' | `source:${string}`
 export type SettingsSave = SettingsBlock | 'pause'
 export type SettingsOrigin = 'panel' | 'tool' | 'sync'
 
@@ -114,7 +156,8 @@ export const POLICY_REVISION = 'mandate-v3'
  * Changes to models, concurrency, pause state, or polling intervals do not invalidate existing decisions.
  */
 export function policyVersion(settings: Settings): string {
-  return key(POLICY_REVISION, JSON.stringify({ rules: settings.policy.rules, mode: settings.eval.mode, sources: settings.policy.sources }))
+  return key(POLICY_REVISION, JSON.stringify({ rules: settings.policy.rules, mode: settings.eval.mode, sources: settings.policy.sources,
+    strategies: settings.policy.strategies }))
 }
 export function allowedSender(settings: Settings, actor: ActorRef): z.infer<typeof AllowedSchema> | undefined {
   return settings.policy.sources[actor.source]?.allowed.find(entry => sameName(entry.id, actor.id))
@@ -188,6 +231,7 @@ export function settingsPolicy(settings: Settings, sources: SourceScope): Policy
   }
   return {
     version, paused: settings.paused, evalTimeoutMs: settings.eval.timeoutSeconds * 1000,
+    strategies: settings.policy.strategies,
     gate(trigger: Trigger, thread, tickets) {
       if (!trigger.human) return machineGate(trigger)
       const allowed = allowedSender(settings, trigger.actor)

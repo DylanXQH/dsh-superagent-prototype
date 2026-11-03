@@ -308,6 +308,8 @@ Some generic modules still refer directly to GitHub or Feishu:
 | `src/core/assignments.ts` | `Assignments`: the Executor's facts and its workers' Reports |
 | `src/core/replies.ts` | `Replies`: the Engine's Channel writes |
 | `src/core/stage.ts` | `ticketStage` and `canRetry`: the Ticket stages of [003 Execution](003-execution.md) |
+| `src/core/task-kind.ts` | Task kinds: `TaskKind` with its workspace, delivery and verification seams; the built-in `file-change`, `analysis` and `code-change` kinds; `TaskKindRegistry`, which selects a kind from the configured rules, a repository hint and each kind's own phrases; and `normalizeArtifact`, which keeps an `ArtifactRef` a reference and drops inlined content |
+| `src/core/strategies.ts` | The four decision layers (triage, planning, assignment, review): each layer's input/verdict seam, the built-in strategies, and `StrategyRegistry`, which a deployment registers implementations in and selects by id from `settings.policy.strategies` |
 | `src/core/errors.ts` | `UserError` and `USER_ERRORS` |
 | `src/core/reasons.ts` | `Reason`, `REASONS` and `reasonText`: why the core recorded a Decision or set a Trigger aside, by code |
 | `src/core/ids.ts` | `key`: ids derived from their inputs, equal for equal inputs |
@@ -351,6 +353,21 @@ Some generic modules still refer directly to GitHub or Feishu:
 | `src/app/views/sources.ts` | The Source status: each Source instance's state, its last day's counts, and what it filtered and dropped in that day |
 | `src/app/views/settings.ts` | The settings page's view: each block with its revision, each Source's settings with its kind's form, and the execution environment |
 | `src/app/views/overview.ts` | The overview: Tickets that need a person, problems, the last day's flow and the Executor's load |
+| `src/app/audit.ts` | The audit trail: every change to what the agent believes or how it is told to behave, in one append-only file |
+| `src/app/baseline.ts` | The capability baseline: what a prompt configuration must still say, no matter how it was edited |
+| `src/app/delivery-commands.ts` | Answers "merge it" and "show me" in the delivery thread, so the notice's promise is a real capability |
+| `src/app/distill.ts` | Deterministic distillation: turns a finished Episode into candidate memories |
+| `src/app/episodes.ts` | P0 memory: a deterministic, model-free record of what a finished ticket was and did, written inside the ending transaction |
+| `src/app/memory-bridge.ts` | Wiring between the host and the `dsh-superagent-memory` package |
+| `src/app/memory-commands.ts` | Memory commands a person can say in chat: 你记得什么 / 忘掉 X / 记住 X |
+| `src/app/memory-page.ts` | The memory page: what the agent currently believes about you, the project, and the machines it runs on |
+| `src/app/memory-store.ts` | Compatibility surface for the host: wrappers over the `ctx.superagentMemory` service for call sites that pass the host store |
+| `src/app/memory-triage.ts` | Deterministic triage of standing instructions in a person's message (M1 candidates) |
+| `src/app/notify.ts` | Proactive Feishu messages the router sends on its own schedule: the daily brief, and the watchdog's stall reports |
+| `src/app/remote-agent.ts` | The router-side adapter of a remote Session: one worker Agent as an Executor-drivable mirror, its events normalized to raw DSH events and deduplicated by seq |
+| `src/app/scan.ts` | Static scan for program-memory changes (M2): policy rules, skills and prompt sections |
+| `src/app/status-commands.ts` | Deterministic answers to "how is my work doing", so checking status never costs a ticket or a worker |
+| `src/app/worker-rpc.ts` | The router's worker endpoint (protocol v1, session plane): registration, leases, session calls, the L1 journal and `events.pull` |
 | `src/executor/dsh.ts` | The DshExecutor, `WorkerSlots`, `ticketExecution`, `inputMessage` and `mandateInstructions` |
 | `src/executor/background.ts` | A worker's background work in DeepSeek Harness, the shell jobs its Session owns (`ctx.jobs`) and its subagents (`ctx.subagents`): `runningJobs`, `untilQuiet`, `killJobs`, `collectJobs`, `stopSubagents`, `stopBackground`, `until`, and `cancelled`, the workers whose turn a stop of their subagents cancelled |
 | `src/infra/commands.ts` | `Commands`, the CLI transport: `run`; `api` and `pages`, limited to the configured repository and validated; `lark` as the bot; `git`. `CliError` carries the code a command's output reports, such as a GitHub HTTP status, and a command that prints nothing fails with how it ended, never with its arguments; `validItems` skips and counts the malformed items of a list |
@@ -374,6 +391,7 @@ Some generic modules still refer directly to GitHub or Feishu:
 | `src/sources/feishu-read.ts` | The `feishu/` reads of a Trigger's message, its root, parent and topic, and `feishuThreadContext`, which gives them to assessments with their images |
 | `src/sources/admission-context.ts` | The bounded window an assessment starts from: the first pages of a Trigger's Thread, read through its kind, and the messages around the Trigger |
 | `src/sources/feishu-image.ts` | Reads a Feishu message's image as an attachment for the assessing Session |
+| `src/sources/mail.ts` | The 163-mail Source: polls the inbox for new mail, turns each into a Trigger, and replies through the same mail CLI |
 | `src/client/index.tsx` | The client plugin entry: the sidebar entry, the main panel and the page in DeepSeek Harness's Plugin Manager |
 | `src/client/app.tsx` | The panel: header, search, glossary, tabs and the page of the current route |
 | `src/client/provider.tsx` | What every page reads from its host: copy, calls, navigation, notices, the state poll, and `restart`, which reads the state quickly while dsh-superagent restarts |
@@ -443,6 +461,8 @@ Some generic modules still refer directly to GitHub or Feishu:
 | `tests/draft.spec.ts`, `tests/prompt-config.spec.ts`, `tests/markdown.spec.ts`, `tests/marks.spec.ts` | Draft states, merges and the save bar's line; the prompt configuration by section and the line diff; the Markdown subset and its links; the mark of every state the views classify |
 | `tests/locales.spec.ts`, `tests/styles.spec.ts` | The copy in both languages, the stylesheet |
 | `tests/class-docs.spec.ts` | Every class in `src` has a JSDoc block before it |
+| `tests/task-kind.spec.ts` | Task-kind routing and its three seams: selection from configured rules, request phrases and the repository hint; verification of ready reports; artifact references and preview bounds |
+| `tests/strategies.spec.ts` | Strategy selection per layer (axiom 7): defaults and configured ids, registering a custom strategy, rules-only triage, bounded planning, least-loaded and tag-match assignment, and the verify and artifacts-required review strategies |
 | `tests/docs.spec.ts` | Numbered documents link only to earlier ones, every local link resolves, no document has merge conflict markers, and this document's tables list every module and every test |
 
 `tests/fixtures/` holds what several tests share: `host.ts`, a simulated DeepSeek Harness host; `panel-server.ts` and `panel.tsx`, the fake management API and the panel around a page; `deployment.ts`, a resolved deployment; `git.ts`, the environment of every git the tests start, which names no repository; and `async.ts`.

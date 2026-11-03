@@ -1,8 +1,8 @@
 /** What the Executor and its workers report about the Assignments that run tickets. */
 import { key } from './ids.ts'
 import { UserError } from './errors.ts'
-import { latestAssignment, liveTicket, runningAssignment } from './model.ts'
-import type { ReportState, Ticket } from './model.ts'
+import { latestAssignment, liveTicket, normalizeArtifact, runningAssignment } from './model.ts'
+import type { ArtifactRef, ReportState, Ticket } from './model.ts'
 import { EnginePart, type EngineOptions } from './part.ts'
 import type { Replies } from './replies.ts'
 import { automatic, type Tickets } from './tickets.ts'
@@ -11,12 +11,35 @@ import { automatic, type Tickets } from './tickets.ts'
 export interface WorkerReport {
   state: ReportState
   summary: string
+  /** Items finished, for partial delivery: a later Assignment can pick up what is left instead of redoing them. */
+  completed?: { item: string; artifact?: ArtifactRef }[]
+  /** Items still to do; with `completed` and `failed` this is how a ticket is finished across several attempts. */
+  remaining?: string[]
+  /** Items that failed, with the reason and whether another attempt may succeed. */
+  failed?: { item: string; reason: string; retryable: boolean }[]
   /** Open question for a person: a string asks it, `null` clears an open one, and `undefined` keeps the current one. */
   question?: string | null
   /** The person's message whose request raised the question; routes the question to the channel where it was written. */
   askedBy?: string
   /** The person's question this report answers, which the worker thereby takes up; authorizes the main Session to send an answer reply. */
   answers?: string
+}
+/** Bound on what a report may say about partial delivery, so a chatty worker cannot bloat the ticket store. */
+const PROGRESS_ITEMS = 50
+const PROGRESS_CHARS = 500
+/**
+ * Normalizes the partial-delivery part of a report: trims and bounds every string, drops empty entries, and keeps at
+ * most `PROGRESS_ITEMS` items of each kind. Returns nothing when the report says nothing about partial delivery.
+ */
+function partial(report: WorkerReport): { completed?: { item: string; artifact?: ArtifactRef }[]; remaining?: string[]; failed?: { item: string; reason: string; retryable: boolean }[] } {
+  const clip = (text: string): string => text.trim().slice(0, PROGRESS_CHARS)
+  // Only a reference is stored: whatever a worker inlined is dropped here, so artifact content never reaches the router.
+  const completed = report.completed?.map(entry => ({ item: clip(entry.item), ...(entry.artifact === undefined ? {} : normalizeArtifact(entry.artifact) ? { artifact: normalizeArtifact(entry.artifact)! } : {}) }))
+    .filter(entry => entry.item.length > 0).slice(0, PROGRESS_ITEMS)
+  const remaining = report.remaining?.map(clip).filter(item => item.length > 0).slice(0, PROGRESS_ITEMS)
+  const failed = report.failed?.map(entry => ({ item: clip(entry.item), reason: clip(entry.reason), retryable: entry.retryable !== false }))
+    .filter(entry => entry.item.length > 0).slice(0, PROGRESS_ITEMS)
+  return { ...(completed?.length ? { completed } : {}), ...(remaining?.length ? { remaining } : {}), ...(failed?.length ? { failed } : {}) }
 }
 const RECOVERY_NOTE = 'The host restarted during this ticket. Inspect the current worktree, git history and GitHub state before continuing. Do not repeat an already completed external operation. Finish the original assignment and report its status.'
 
@@ -119,7 +142,8 @@ export class Assignments extends EnginePart {
     else delete ticket.attention
     // A replaced or cleared attention question withdraws any pending unsent reply for the previous question from the outbox.
     if (previous && previous.id !== attention?.id) this.replies.withdrawAttention(previous.id)
-    assignment.report = { state: report.state, summary: report.summary, at }
+    assignment.report = { state: report.state, summary: report.summary, at, ...partial(report) }
+    delete ticket.hold
     ticket.updatedAt = at
     if (report.answers && !ticket.answers?.includes(report.answers)) ticket.answers = [...ticket.answers ?? [], report.answers]
     if (report.answers) this.takeUp(ticketId, report.answers)

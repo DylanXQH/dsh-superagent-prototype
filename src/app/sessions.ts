@@ -1,4 +1,5 @@
 /** Lifecycle, prompt/tool/skill decoration, message delivery, and budget retry tracking for orchestrator and worker DSH sessions. */
+import { recall, recallCard } from './memory-store.ts'
 import type { Context } from '@deepseek-ai/cordis'
 import type { Agent } from '@deepseek-ai/dsh-agent'
 import type { MessageId } from '@deepseek-ai/dsh-llm'
@@ -6,10 +7,12 @@ import { scopeParentOf } from '@deepseek-ai/dsh-scope'
 import type { SessionId } from '@deepseek-ai/dsh-session'
 import { dirname } from 'node:path'
 import { z } from 'zod'
-import { key, liveTicket, type Ticket } from '../core/index.ts'
+import { builtinStrategies, key, liveTicket, NoWorkerCapacityError, type StrategyFact, type Ticket } from '../core/index.ts'
 import { mandateInstructions, ticketOfSession } from '../executor/dsh.ts'
 import type { HealthEntry } from '../infra/health.ts'
 import { AgentDelivery, messageId } from './delivery.ts'
+import { RemoteAgent, type ExecutorAgent } from './remote-agent.ts'
+import { activeWorkerRpcHub } from './worker-rpc.ts'
 import type { Effects } from './effects.ts'
 import type { Variable } from './execution-environment.ts'
 import { RetryHealth } from './retry-health.ts'
@@ -67,6 +70,9 @@ const NO_WAIT = 'Reports, follow_up notices, new candidates and a background job
 const DEFAULT_WAIT = 'This shell waits up to 60 seconds by default: pass timeoutMs of at most 30000, or run_in_background, '
   + 'as a waiting step holds back new candidates.'
 /** `sleep` at a command position: the start, after ; & | ( { ! ` or a newline, or after a keyword or a command that runs it. */
+/** How long `session.ensure` may take: it clones the ticket's repository on the worker. */
+const PREPARE_RPC_TIMEOUT_MS = 300_000
+
 const SLEEP = /(?:^|[;&|({!`\n]|\b(?:do|then|else|elif|if|while|until|time|exec|nohup|command|env)\s)\s*(?:\S*\/)?sleep\b/
 /**
  * The main Session's guard: it refuses a bash command that runs sleep or asks to hold the step longer than 30 seconds, and a
@@ -95,6 +101,13 @@ export class Sessions {
   /** Decorated agents mapped to their registered disposers and skill scope until the agent is disposed or `Sessions.dispose()` runs. */
   private readonly bindings = new Map<Agent, SessionBinding>()
   private readonly retryHealth = new RetryHealth()
+  /** Sessions executing on a remote worker, keyed by session id; their DSH Agent lives in the worker process. */
+  private readonly remote = new Map<string, RemoteAgent>()
+  /**
+   * Which assignment strategy placed a session, and the facts it used; the executor copies this into the ticket's basis
+   * chain once the assignment starts (axiom 7 + axiom 5).
+   */
+  private readonly placements = new Map<string, { strategy: string; facts: StrategyFact[] }>()
   private readonly ctx: Context
   /** Registers ordered `relay` and `notice` effect handlers that deliver to the main Session. */
   constructor(private readonly host: SessionsHost) {
@@ -135,7 +148,10 @@ export class Sessions {
     })
   }
   /** Resolves or creates session `id` in workspace `cwd`, initializes its role model, decorates it with prompts/skills/tools, sets `danger-full-access` permissions, and renames it to `title`. */
-  async ensure(id: string, cwd: string, title: string, role: 'orchestrator' | 'worker'): Promise<Agent> {
+  async ensure(id: string, cwd: string, title: string, role: 'orchestrator' | 'worker', env?: Record<string, string>, forceLocal = false,
+    prepareOverride?: string): Promise<ExecutorAgent> {
+    // A host-maintenance Session must run in this process: it edits the router's own files, which a remote worker cannot reach.
+    if (role === 'worker' && !forceLocal && this.host.store.settings().executor.placement === 'remote') return this.ensureRemote(id, cwd, title, env, prepareOverride)
     const ctx = this.ctx
     let result = await ctx.sessionController.resolveAgent(id as SessionId)
     if ('error' in result && result.error.code === 'session/not-found') {
@@ -151,16 +167,189 @@ export class Sessions {
     await this.decorate(result.agent)
     ctx.permissionPresets.set(result.agent.session, 'danger-full-access')
     await ctx.sessionController.rename({ sessionId: id as SessionId, title })
+    // A local placement is a placement too: record it so a ticket's basis chain says why it did not go to a worker.
+    this.placements.set(id, { strategy: 'local', facts: [{ name: 'placement', value: 'local' }] })
     return result.agent
+  }
+  /**
+   * Creates (or reuses) the adapter for a Session that runs on a registered remote worker.
+   * The worker owns the DSH Agent; this side keeps only a mirror that executor can drive.
+   */
+  /** `prepareOverride` is the task kind's say on the worker's prepare command: undefined sends the configured one, '' sends none. */
+  private async ensureRemote(id: string, cwd: string, title: string, env?: Record<string, string>, prepareOverride?: string): Promise<RemoteAgent> {
+    const existing = this.remote.get(id)
+    if (existing) return existing
+    const hub = activeWorkerRpcHub()
+    if (!hub) throw new Error('executor.placement is "remote" but the worker RPC hub is not running')
+    const settings = this.host.store.settings()
+    // 公理 7：选哪台机器是一个可替换的决策层。默认 least-loaded 与旧行为一致；配置 tag-match 则先按能力标签过滤。
+    const selection = settings.policy.strategies
+    const strategy = builtinStrategies().assignment(selection.assignment)
+    const candidates = hub.workers.map(worker => ({
+      id: worker.workerId,
+      tags: worker.tags ?? {},
+      load: Math.max(worker.activeSessions, worker.assignedSessions),
+      capacity: worker.maxConcurrentSessions,
+    }))
+    const choice = strategy.choose({ candidates, requiredTags: selection.requiredTags })
+    const worker = choice.id === undefined ? undefined : hub.workers.find(candidate => candidate.workerId === choice.id)
+    if (!worker) {
+      const states = hub.workers.map(w => `${w.workerId}:${Math.max(w.activeSessions, w.assignedSessions)}/${w.maxConcurrentSessions}`)
+      throw new NoWorkerCapacityError(states.join(','), states)
+    }
+    const agent = new RemoteAgent({
+      workerId: worker.workerId,
+      sessionId: id,
+      call: (method, params) => hub.callWorker(worker.workerId, method, params),
+      history: () => hub.eventsOf(id),
+      onDispose: () => hub.release(worker.workerId),
+      log: message => { this.ctx.logger.info('[dsh-superagent] %s', message) },
+      // The worker registers an inert `orchestrator_report`; the call lands here and runs on the router.
+      onReport: (args, callId) => this.reportRemote(id, args, callId),
+    })
+    // The worker has no PromptVersion of ours: the skill bodies travel with the request, so a remote worker
+    // runs the same operational skills as an in-process one.
+    const version = this.host.prompts.current()
+    const specs = this.host.prompts.skills(version.config).map(([name, content]) => ({
+      name: `${SKILL_PREFIX}${name}`,
+      description: content.replace(/\s+/g, ' ').slice(0, 120) || 'Custom dsh-superagent operational skill.',
+      content,
+    }))
+    // 这台机器的环境事实 + 对所有机器都成立的事实：worker 用它避开已知的坑（例如本机不能直连 GitHub）。
+    const memory = [this.environmentCard(worker.name), this.knowledgeCard(title)].filter(part => part.length > 0).join('\n\n')
+    // 先占位：ensure 要跑几十秒的 clone，期间并发的派发必须看得到这次占用。
+    hub.reserve(worker.workerId)
+    // Preparing a workspace clones a repository, so it outlives the default control-plane timeout.
+    await hub.callWorker(worker.workerId, 'session.ensure', {
+      sessionId: id, cwd, title, name: title, promptText: '', skills: specs, model: settings.executor.model ?? null,
+      ...(prepareOverride === undefined ? (settings.executor.prepare ? { prepare: settings.executor.prepare } : {}) : (prepareOverride ? { prepare: prepareOverride } : {})),
+      // The worker has no Source of its own: the ticket's execution environment describes the router's source.
+      ...(env && Object.keys(env).length > 0 ? { env } : {}),
+      ...(memory ? { memory } : {}),
+      // The worker has no PromptVersion of ours: send the composed worker prompt so remote sessions follow the same rules.
+      policy: this.host.prompts.compose(version.config, 'worker'),
+      // 公理 4：router 派出的会话归 router 所有，worker 本地只读围观，不允许在旁边插话。
+      owner: 'router',
+    }, PREPARE_RPC_TIMEOUT_MS).catch(error => {
+      hub.release(worker.workerId)
+      hub.settle(worker.workerId)
+      throw error
+    })
+    hub.settle(worker.workerId)
+    this.placements.set(id, { strategy: strategy.id, facts: choice.facts })
+    this.remote.set(id, agent)
+    this.ctx.logger.info('[dsh-superagent] session %s runs on remote worker %s', id, worker.workerId)
+    return agent
+  }
+  /**
+   * Renders the environment facts that apply to `workerId`: its own probes plus entries that hold for every worker.
+   * The card is bounded so a chatty worker cannot crowd the task out of the prompt.
+   */
+  private environmentCard(workerId: string): string {
+    const entries = this.host.store.memories.list({ scope: 'env', owner: workerId, limit: 40 })
+    return recallCard(entries, 1000)
+  }
+
+  /**
+   * What we already know about this kind of task, for the worker to read before it starts.
+   *
+   * The query is the ticket title — the closest thing to a stated intent that exists before the worker runs. Env facts
+   * are excluded on purpose: they describe *a machine*, and only the machine that will run the task should see them.
+   */
+  private knowledgeCard(query: string): string {
+    const trimmed = query.trim()
+    if (trimmed.length === 0) return ''
+    const entries = recall(this.host.store, trimmed, { limit: 8 }).filter(entry => entry.scope !== 'env')
+    return recallCard(entries, 900)
+  }
+  /** Which strategy placed a session and what it knew when it did; the executor records it once the assignment starts. */
+  placement(sessionId: string): { strategy: string; facts: StrategyFact[] } | undefined { return this.placements.get(sessionId) }
+  /** Feeds events pushed by the worker hub into the matching remote adapter. */
+  deliverRemoteEvents(sessionId: string, events: readonly unknown[]): void {
+    this.remote.get(sessionId)?.applyEvents(events)
+  }
+  /**
+   * Runs an `orchestrator_report` the worker's Session made: the tool exists on the worker only so the call shows up
+   * in the event stream, and the ticket-side effect belongs here, where the ticket, the store and the notices live.
+   */
+  /**
+   * Remote Sessions that have stopped producing events for longer than `quietMs`.
+   * The watchdog reports them to a person and, past the longer limit, blocks the ticket itself.
+   */
+  stalledSessions(now: number, quietMs: number): Array<{ sessionId: string; ticketId: string; title: string; idleMs: number }> {
+    const stalled: Array<{ sessionId: string; ticketId: string; title: string; idleMs: number }> = []
+    for (const [sessionId, agent] of this.remote) {
+      const idleMs = now - agent.lastEventAt
+      if (idleMs < quietMs) continue
+      const ticketId = ticketOfSession(sessionId)
+      const ticket = ticketId === undefined ? undefined : this.host.store.tickets.get(ticketId)
+      if (!ticket || ticket.ended) continue
+      stalled.push({ sessionId, ticketId: ticket.id, title: ticket.title, idleMs })
+    }
+    return stalled
+  }
+
+  /** Ends the sessions a disconnected worker was holding; their tickets cannot finish on their own. */
+  blockWorkerLost(sessionId: string): void {
+    this.reportRemote(sessionId, { state: 'blocked', summary: '执行这台任务的 worker 断开了连接，任务随之中断。你可以让我重跑，或先检查那台机器。' }, `worker-lost:${sessionId}`)
+  }
+
+  /** Blocks a stalled ticket through the same report path a worker's own `blocked` report takes. */
+  blockStalled(sessionId: string, minutes: number): void {
+    this.reportRemote(sessionId, { state: 'blocked', summary: `超过 ${minutes} 分钟没有任何进展，看门狗已标记阻塞；请检查 worker 状态或重新安排这项任务。` }, `watchdog:${sessionId}:${minutes}`)
+  }
+
+  private reportRemote(sessionId: string, raw: unknown, callId: string): void {
+    const ticketId = ticketOfSession(sessionId)
+    const ticket = ticketId === undefined ? undefined : this.host.store.tickets.get(ticketId)
+    if (!ticket) {
+      console.error('[dsh-superagent] 远程会话 %s 的 %s 找不到票据，已忽略', sessionId, callId)
+      return
+    }
+    const report = this.host.tools({ id: sessionId } as unknown as Agent, ticket).find(entry => entry.name === 'orchestrator_report')
+    if (!report) return
+    void Promise.resolve(report.schema.safeParseAsync(raw)).then(
+      parsed => {
+        if (!parsed.success) {
+          console.error('[dsh-superagent] 远程会话 %s 的报告参数无效: %s', sessionId, JSON.stringify(parsed.error.issues.slice(0, 3)))
+          return
+        }
+        void report.execute(parsed.data as never, this.host.lifetime).catch((error: unknown) => {
+          console.error('[dsh-superagent] 远程会话 %s 的报告执行失败: %s', sessionId, String(error))
+        })
+      },
+      (error: unknown) => console.error('[dsh-superagent] 远程会话报告解析失败: %s', String(error)),
+    )
+  }
+  /**
+   * Bridges a remote Session's status transition onto DSH's `agent/status`, which the executor listens to:
+   * without it a remote worker would never look idle and its ticket would never be assessed.
+   */
+  publishRemoteStatus(sessionId: string): void {
+    const agent = this.remote.get(sessionId)
+    if (!agent || agent.lastPublished === agent.status) return
+    agent.lastPublished = agent.status
+    this.ctx.logger.info('[dsh-superagent] remote session %s status %s', sessionId, agent.status)
+    this.ctx.emit('agent/status', { agent: agent as unknown as Agent, status: agent.status as 'idle' | 'running' })
   }
   /** Returns whether `sessionId` already holds the message delivered under `requestId`, or `false` if the session does not exist. */
   async holds(sessionId: string, requestId: string): Promise<boolean> {
+    const remote = this.remote.get(sessionId)
+    if (remote) return remote.holds(requestId)
     const result = await this.ctx.sessionController.resolveAgent(sessionId as SessionId)
     return !('error' in result) && await this.agentDelivery.holds(result.agent, key(requestId))
   }
   /** Deliver a message once per request id: to the next turn, the current one, or `inject`ed with its label without waking the agent. */
   async prompt(sessionId: string, requestId: string, text: string, mode: 'queue' | 'steer' | { inject: string }, authorize?: () => void,
     accepted?: () => void): Promise<void> {
+    const remote = this.remote.get(sessionId)
+    if (remote) {
+      authorize?.()
+      remote.markDelivered(requestId)
+      await remote.prompt(requestId, text, mode)
+      accepted?.()
+      return
+    }
     const result = await this.ctx.sessionController.resolveAgent(sessionId as SessionId)
     if ('error' in result) throw result.error
     await this.agentDelivery.send(result.agent, key(requestId), text, mode, this.host.lifetime, authorize, accepted)

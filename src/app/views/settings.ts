@@ -22,11 +22,11 @@ function policyOf(sources: SourceRegistry, id: string, health: HealthMap) {
  */
 export function settingsView(store: Store, sources: SourceRegistry, health: HealthMap, setup: SetupState, stateDir: string) {
   const settings = store.settings()
-  const block = <V>(name: 'policy' | 'eval' | 'executor', value: V) => ({ value, revision: store.blockRevision(name) })
+  const block = <V>(name: 'policy' | 'eval' | 'executor' | 'notify', value: V) => ({ value, revision: store.blockRevision(name) })
   return {
     policyVersion: policyVersion(settings),
     blocks: { policy: block('policy', settings.policy), eval: block('eval', settings.eval), executor: block('executor',
-      settings.executor) },
+      settings.executor), notify: block('notify', settings.notify) },
     sources: sources.instances(settings).map(instance => {
       const kind = sources.kind(instance.kind)
       const problem = problemOf(instance.id, setup)
